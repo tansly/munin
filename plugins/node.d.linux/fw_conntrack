@@ -99,6 +99,8 @@ syn_sent.label SYN_SENT
 syn_sent.type GAUGE
 syn_sent.draw STACK
 syn_recv.label SYN_RECV
+syn_recv.warning 50
+syn_recv.critical 100
 syn_recv.type GAUGE
 syn_recv.draw STACK
 udp.label UDP connections
