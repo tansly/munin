@@ -1,0 +1,317 @@
+#!/usr/bin/perl
+# Tests for Munin::Master::Update - _db_groups_update and get_hosts
+#
+# Tests importing groups/hosts from config tree into SQLite
+
+use strict;
+use warnings;
+
+use lib qw(lib t/lib);
+
+use Test::More;
+use Test::Exception;
+use File::Temp qw(tempfile);
+use IO::Handle;
+
+use lib qw(lib);
+
+# ============================================================================
+# SETUP: Create a temp DB and config
+# ============================================================================
+
+# Reset config singleton
+delete $INC{'lib/Munin/Master/Config.pm'};
+require Munin::Master::Config;
+
+# Create temp database
+my ($fh, $dbpath) = tempfile(CLEANUP => 1, SUFFIX => '.db');
+close $fh;
+
+# Create config instance and parse test config
+my $config_obj = Munin::Master::Config->instance();
+my $config = $config_obj->{config};
+
+# Set up dbdir for the test
+use TestState;
+$config->{dbdir} = TestState::state_dir();
+
+# Not setup_test_config(): parses a generated group/host conf from a
+# string to exercise config import, and overrides get_dbh -- the shared
+# t/config/munin.conf has no groups to import.
+# Parse a test config with groups and hosts
+my $test_config = <<'EOF';
+dbdir /var/lib/munin
+tmpldir /etc/munin/templates
+fork 1
+timeout 180
+
+[web;app1.example.com]
+    address 10.0.0.1
+    port 4949
+
+[web;app2.example.com]
+    address 10.0.0.2
+
+[db;db1.example.com]
+    address 10.0.1.1
+    port 4950
+    update 0
+
+[prod;webservers;web01.example.com]
+    address 10.0.2.1
+    update_priority 1
+EOF
+
+my $io = IO::Handle->new;
+open($io, '<', \$test_config) or die "Cannot open string: $!";
+$config->parse_config($io);
+close $io;
+
+# Now test the import
+
+# Load Update.pm
+require Munin::Master::Update;
+
+# Create a mock Update object (we don't need to actually run update)
+my $update = bless {
+    config => $config,
+}, 'Munin::Master::Update';
+
+# Override get_dbh to use our temp DB. Raw DBI->connect, NOT
+# TestUtils::dbh_rw: this must faithfully mock production's get_dbh
+# (Update.pm:128-136), which sets AutoCommit 0 by default and honors
+# $is_read_only / MUNIN_DB_AUTOCOMMIT. Reproducing that contract here is
+# the point -- a test helper's connection defaults would hide a
+# divergence between this mock and real update runs.
+no warnings 'redefine';
+*Munin::Master::Update::get_dbh = sub {
+    my ($is_read_only) = @_;
+    use DBI;
+    my $dbh = DBI->connect(
+        "dbi:SQLite:dbname=$dbpath",
+        '', '',
+        {
+            RaiseError => 1,
+            sqlite_unicode => 1,
+        }
+    ) or die "Cannot connect: $DBI::errstr";
+    # Faithful to production get_dbh: PRAGMAs first, while AutoCommit is
+    # still on (sqlite ignores foreign_keys changes inside a transaction),
+    # then the AutoCommit contract.
+    $dbh->do("PRAGMA foreign_keys=ON;");
+    $dbh->{AutoCommit} = 0;
+    $dbh->{AutoCommit} = 1 if $is_read_only;
+    return $dbh;
+};
+use warnings 'redefine';
+
+# Initialize schema
+{
+    my $dbh = Munin::Master::Update::get_dbh();
+    $update->_db_init($dbh);
+    $dbh->disconnect();
+}
+
+# Test 1: Import groups
+subtest 'import groups from config' => sub {
+    # Run the import
+    eval { $update->_db_groups_update() };
+    ok(!$@, '_db_groups_update runs without error');
+    diag($@) if $@;
+
+    # Verify with get_hosts
+    my $hosts_dbh = Munin::Master::Update::get_dbh();
+    my $hosts = Munin::Master::Update::get_hosts($hosts_dbh);
+    $hosts_dbh->disconnect();
+    ok(ref $hosts eq 'ARRAY', 'get_hosts returns arrayref');
+    is(scalar @$hosts, 4, 'Found 4 hosts');
+
+    # Check host names
+    my @host_names = sort map { $_->{name} } @$hosts;
+    is_deeply(\@host_names, [
+        'app1.example.com',
+        'app2.example.com',
+        'db1.example.com',
+        'web01.example.com',
+    ], 'Host names are correct');
+};
+
+subtest 'host attributes imported correctly' => sub {
+    my $hosts_dbh = Munin::Master::Update::get_dbh();
+    my $hosts = Munin::Master::Update::get_hosts($hosts_dbh);
+    $hosts_dbh->disconnect();
+
+    # Find app1.example.com
+    my ($app1) = grep { $_->isa('Munin::Master::Host') && $_->{host_name} eq 'app1.example.com' } @$hosts;
+    ok($app1, 'Found app1.example.com');
+    is($app1->{address}, '10.0.0.1', 'app1 address correct');
+    is($app1->{port}, 4949, 'app1 port correct');
+    is($app1->{group}{group_name}, 'web', 'app1 group correct');
+    like($app1->get_full_path, qr/web;app1\.example\.com/, 'app1 get_full_path works');
+
+    # Find db1.example.com (has update=0)
+    my ($db1) = grep { $_->isa('Munin::Master::Host') && $_->{host_name} eq 'db1.example.com' } @$hosts;
+    ok($db1, 'Found db1.example.com');
+    is($db1->{address}, '10.0.1.1', 'db1 address correct');
+    is($db1->{port}, 4950, 'db1 port correct');
+    is($db1->{update}, 0, 'db1 update disabled');
+    is($db1->{group}{group_name}, 'db', 'db1 group correct');
+
+    # Find web01.example.com (nested group)
+    my ($web01) = grep { $_->isa('Munin::Master::Host') && $_->{host_name} eq 'web01.example.com' } @$hosts;
+    ok($web01, 'Found web01.example.com');
+    is($web01->{address}, '10.0.2.1', 'web01 address correct');
+    is($web01->{update_priority}, 1, 'web01 update_priority correct');
+    like($web01->get_full_path, qr/prod;webservers;web01\.example\.com/, 'web01 get_full_path works');
+};
+
+subtest 'groups exist in grp table' => sub {
+    my $dbh = Munin::Master::Update::get_dbh();
+
+    # Count groups (excluding root)
+    my ($count) = $dbh->selectrow_array(
+        'SELECT COUNT(*) FROM grp WHERE id != 0'
+    );
+    is($count, 4, 'Found 4 groups (web, db, prod, webservers)');
+
+    # Check group names
+    my $sth = $dbh->prepare('SELECT name FROM grp WHERE id != 0 ORDER BY name');
+    $sth->execute();
+    my @names;
+    while (my ($name) = $sth->fetchrow_array) {
+        push @names, $name;
+    }
+    is_deeply(\@names, ['db', 'prod', 'web', 'webservers'], 'Group names correct');
+
+    $dbh->disconnect();
+};
+
+subtest 're-import diffs: stale swept, survivors keep ids and history' => sub {
+    # Seed a stale host WITH history (service/ds/RRD mapping/state) that
+    # is not in the config, plus history on a surviving host.
+    my $dbh = Munin::Master::Update::get_dbh();
+    my ($web_id) = $dbh->selectrow_array("SELECT id FROM grp WHERE name = 'web'");
+
+    $dbh->do("INSERT INTO node (grp_id, name, path) VALUES (?, 'stale.example.com', 'web;stale.example.com')", undef, $web_id);
+    my $stale_node = $dbh->last_insert_id(undef, undef, 'node', 'id');
+    $dbh->do("INSERT INTO node_attr (id, name, value) VALUES (?, 'address', '10.9.9.9')", undef, $stale_node);
+    $dbh->do("INSERT INTO service (node_id, name) VALUES (?, 'cpu')", undef, $stale_node);
+    my ($stale_svc) = $dbh->selectrow_array("SELECT id FROM service WHERE node_id = ?", undef, $stale_node);
+    $dbh->do("INSERT INTO ds (service_id, name) VALUES (?, 'load')", undef, $stale_svc);
+    my ($stale_ds) = $dbh->selectrow_array("SELECT id FROM ds WHERE service_id = ?", undef, $stale_svc);
+    $dbh->do("INSERT INTO ds_rrd (ds_id, file, field) VALUES (?, 'stale.rrd', 'load-g')", undef, $stale_ds);
+    $dbh->do("INSERT INTO state (ds_id) VALUES (?)", undef, $stale_ds);
+
+    my ($app1_node) = $dbh->selectrow_array("SELECT id FROM node WHERE path = 'web;app1.example.com'");
+    $dbh->do("INSERT INTO service (node_id, name) VALUES (?, 'cpu')", undef, $app1_node);
+    my ($app1_svc) = $dbh->selectrow_array("SELECT id FROM service WHERE node_id = ?", undef, $app1_node);
+    $dbh->do("INSERT INTO ds (service_id, name) VALUES (?, 'idle')", undef, $app1_svc);
+    my ($app1_ds) = $dbh->selectrow_array("SELECT id FROM ds WHERE service_id = ?", undef, $app1_svc);
+    $dbh->do("INSERT INTO state (ds_id, last_epoch) VALUES (?, 1700000000)", undef, $app1_ds);
+    # get_dbh is AutoCommit=0: commit the fixture or the disconnect
+    # below rolls the whole seed back
+    $dbh->commit();
+    $dbh->disconnect();
+
+    # Re-import: config unchanged -> survivors untouched, stale swept
+    $update->_db_groups_update();
+
+    my $check = Munin::Master::Update::get_dbh();
+    my $hosts = Munin::Master::Update::get_hosts($check);
+    is(scalar @$hosts, 4, 'stale host removed, 4 config hosts remain');
+
+    my ($gone) = $check->selectrow_array("SELECT count(1) FROM node WHERE id = ?", undef, $stale_node);
+    is($gone, 0, 'stale node row gone');
+    ($gone) = $check->selectrow_array("SELECT count(1) FROM service WHERE node_id = ?", undef, $stale_node);
+    is($gone, 0, 'stale services swept');
+    ($gone) = $check->selectrow_array("SELECT count(1) FROM ds WHERE service_id = ?", undef, $stale_svc);
+    is($gone, 0, 'stale ds swept');
+    ($gone) = $check->selectrow_array("SELECT count(1) FROM ds_rrd WHERE ds_id = ?", undef, $stale_ds);
+    is($gone, 0, 'stale RRD mapping swept');
+    ($gone) = $check->selectrow_array("SELECT count(1) FROM state WHERE ds_id = ?", undef, $stale_ds);
+    is($gone, 0, 'stale state swept');
+    ($gone) = $check->selectrow_array("SELECT count(1) FROM node_attr WHERE id = ?", undef, $stale_node);
+    is($gone, 0, 'stale node attrs swept');
+
+    my ($app1_after) = $check->selectrow_array("SELECT id FROM node WHERE path = 'web;app1.example.com'");
+    is($app1_after, $app1_node, 'survivor keeps its node id');
+    my ($epoch) = $check->selectrow_array("SELECT last_epoch FROM state WHERE ds_id = ?", undef, $app1_ds);
+    is($epoch, 1700000000, 'survivor state history untouched');
+    $check->disconnect();
+
+    # A second import keeps ids stable -- no id churn, by design now
+    $update->_db_groups_update();
+    my $again = Munin::Master::Update::get_dbh();
+    my ($app1_twice) = $again->selectrow_array("SELECT id FROM node WHERE path = 'web;app1.example.com'");
+    is($app1_twice, $app1_node, 'ids stable across re-imports');
+    $again->disconnect();
+};
+
+# Test config_override import
+# First, let's add some service/field config to test with
+my $test_config_with_overrides = <<'EOF';
+dbdir /var/lib/munin
+tmpldir /etc/munin/templates
+
+[web;app1.example.com]
+    address 10.0.0.1
+    port 4949
+    timeout 60
+
+[web;app1.example.com:cpu]
+    graph_title CPU Usage
+    user.warning 80
+    user.critical 95
+    user.label User
+
+[db;db1.example.com]
+    address 10.0.1.1
+    timeout 120
+EOF
+
+# Re-parse config with overrides
+my $io2 = IO::Handle->new;
+open($io2, '<', \$test_config_with_overrides) or die "Cannot open string: $!";
+$config->parse_config($io2);
+close $io2;
+
+# Re-import groups
+$update->_db_groups_update();
+
+subtest 'config overrides imported' => sub {
+    # Import config
+    eval { $update->_db_import_config() };
+    ok(!$@, '_db_import_config runs without error');
+    diag($@) if $@;
+
+    # Check host-level override
+    my $ovr_dbh = Munin::Master::Update::get_dbh();
+    my $val = Munin::Master::Update::get_override('app1.example.com', '', '', 'timeout', $ovr_dbh);
+    is($val, '60', 'Host-level timeout override found');
+
+    # Check service-level override
+    $val = Munin::Master::Update::get_override('app1.example.com', 'cpu', '', 'graph_title', $ovr_dbh);
+    is($val, 'CPU Usage', 'Service-level graph_title override found');
+
+    # Check field-level override
+    $val = Munin::Master::Update::get_override('app1.example.com', 'cpu', 'user', 'warning', $ovr_dbh);
+    is($val, '80', 'Field-level warning override found');
+
+    $val = Munin::Master::Update::get_override('app1.example.com', 'cpu', 'user', 'critical', $ovr_dbh);
+    is($val, '95', 'Field-level critical override found');
+
+    $val = Munin::Master::Update::get_override('app1.example.com', 'cpu', 'user', 'label', $ovr_dbh);
+    is($val, 'User', 'Field-level label override found');
+
+    # Check db1 timeout
+    $val = Munin::Master::Update::get_override('db1.example.com', '', '', 'timeout', $ovr_dbh);
+    is($val, '120', 'db1 timeout override found');
+
+    # Check nonexistent returns undef
+    $val = Munin::Master::Update::get_override('app1.example.com', 'cpu', 'user', 'nonexistent', $ovr_dbh);
+    is($val, undef, 'Nonexistent override returns undef');
+
+    $ovr_dbh->disconnect();
+};
+
+done_testing();

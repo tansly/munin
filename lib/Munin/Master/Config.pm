@@ -18,9 +18,6 @@ use base qw(Munin::Common::Config);
 # Please note that the munin-node configuration is also based on
 # Munin::Common::Config but is quite a lot simpler with regards to syntax
 #
-# The Class Munin::Master::GroupRepository is based on Munin::Master::Config
-# and contains a tree of Munin::Master::Group objects.
-#
 # The M::M::Group objects can be nested.  Under a M::M::Group object there
 # can be a (flat) collection of M::M::Host objects.  The M::M::Host class
 # is based in M::M::Group.
@@ -365,7 +362,7 @@ sub _concat_config_line_ok {
     my ($self, $prefix, $key, $value) = @_;
 
     if (!defined($key) or !$key) {
-	ERROR "[ERROR] Somehow we're missing a keyword sometime after section [$prefix]";
+	ERROR "Somehow we're missing a keyword sometime after section [$prefix]";
 	die "[ERROR] Somehow we're missing a keyword sometime after section [$prefix]";
     }
 
@@ -379,7 +376,7 @@ sub _concat_config_line_ok {
     };
     if ($@) {
 	# _split_config_line_ok already logged the problem.
-	my $err_msg = "[ERROR] config error under [$prefix] for '$key $value' : $@";
+	my $err_msg = "config error under [$prefix] for '$key $value' : $@";
 	ERROR $err_msg;
 	die $err_msg;
     }
@@ -466,7 +463,7 @@ sub _split_config_line_ok {
 
     if ($host =~ /[^-A-Za-z0-9\.]/) {
 	# Since we're not quite sure what context we're called in we'll report the error message more times rather than fewer.
-	ERROR "[ERROR] Hostname '$host' contains illegal characters (http://en.wikipedia.org/wiki/Hostname#Restrictions_on_valid_hostnames).  Please fix this by replacing illegal characters with '-'.  Remember to do it on both in the master configuration and on the munin-node.";
+	ERROR "Hostname '$host' contains illegal characters (http://en.wikipedia.org/wiki/Hostname#Restrictions_on_valid_hostnames).  Please fix this by replacing illegal characters with '-'.  Remember to do it on both in the master configuration and on the munin-node.";
 	croak "[ERROR] Hostname '$host' contains illegal characters (http://en.wikipedia.org/wiki/Hostname#Restrictions_on_valid_hostnames).  Please fix this by replacing illegal characters with '-'.  Remember to do it on both in the master configuration and on the munin-node.\n";
     }
 
@@ -495,15 +492,22 @@ sub parse_config {
 
     while (my $line = <$io>) {
         $self->_strip_comment($line);
-        $self->_trim($line);
+        chomp $line;
 
 	# Handle continuation lines (ending in \)
 	if ($line =~ s|\\$||) {
+	    # Line ends with backslash: this is a continuation
+	    # Don't trim - preserve whitespace between parts
 	    $continuation .= $line;
 	    next;
-	} elsif ($continuation) {
+	} elsif (length($continuation)) {
+	    # Final continuation line: join and trim the whole thing
 	    $line = $continuation . $line;
+	    $self->_trim($line);
 	    $continuation = '';
+	} else {
+	    # Normal line: trim as before
+	    $self->_trim($line);
 	}
 
         # This must be handled after continuation handling otherwise
@@ -522,69 +526,6 @@ sub parse_config {
 	    $self->_parse_config_line($prefix,$key,$value);
         }
     }
-}
-
-
-sub look_up {
-	# The path through the hash works out to:
-	# $self->{groups}{localdomain}[...]{hosts}{localhost}
-
-    my ($self,$key) = @_;
-
-    my (@groups) = split(';',$key);
-    my $host = pop(@groups);
-
-    my $value = $self;
-
-    for my $group (@groups) {
-	if (defined $value and
-	    defined $value->{groups} and
-	    defined $value->{groups}{$group}) {
-
-	    $value = $value->{groups}{$group};
-
-	} else {
-	    return;
-	}
-    }
-
-    if (defined $value and
-	defined $value->{hosts} and
-	defined $value->{hosts}{$host}) {
-
-	return $value->{hosts}{$host};
-    };
-
-    return;
-}
-
-
-sub get_groups_and_hosts {
-    my ($self) = @_;
-
-    return $self->{groups};
-}
-
-
-sub get_all_hosts {
-    # Note! This method is implemented in multiple classes to make the
-    # recursion complete.
-    my ($self) = @_;
-
-    my @hosts = ();
-    for my $group (values %{$self->{groups}}) {
-        push @hosts, $group->get_all_hosts;
-    }
-    return @hosts;
-}
-
-
-
-sub set {
-    my ($self, $config) = @_;
-
-    # Note: config overrides self.
-    %$self = (%$self, %$config);
 }
 
 
@@ -619,34 +560,6 @@ Set a value in the config, where $longkey is the full ;:. separated value.
 
 Populates the fields of $config from the configuration file referred to by
 filehandle $io.
-
-=item B<look_up>
-
-  my $value = $config->look_up($key);
-
-Look up a group/host by a key such as "localdomain;localhost" etc.
-If the path does not exist create it with correct class and so on.
-
-Lookup ends at host name.  If something is missing along the way
-undef is returned.
-
-=item B<get_groups_and_hosts>
-
-  my $gah = $config->get_groups_and_hosts();
-
-Returns all the groups and hosts defined in the configuration.
-
-=item B<get_all_hosts>
-
-  my $hosts = $config->get_all_hosts();
-
-Returns a list of all the hosts defined in the configuration.
-
-=item B<set>
-
-  $config->set(\%attrs);
-
-Sets the keys and values in $config to those in %attrs.
 
 =back
 

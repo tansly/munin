@@ -26,6 +26,12 @@ sub handle_request
 	my %cookies = CGI::Cookie->fetch;
 	my $path = $cgi->path_info();
 
+	# One read-only handle per request, threaded through every helper below
+	# instead of reconnecting per query. Opened where SQL is first needed:
+	# the static branch needs it for staticdir, the main body below needs it
+	# throughout; pure redirects need no SQL at all.
+	use Munin::Master::Update;
+
 	# Handle static page now, since there is no need to do any SQL
 	if ($path =~ m/static\/(.+)$/) {
 		# Emit the static page
@@ -54,7 +60,9 @@ sub handle_request
 			gif => "image/gif",
 		);
 
-		my $filename = get_param("staticdir"). "/$page";
+		my $dbh = Munin::Master::Update::get_dbh(1);
+		my $staticdir = Munin::Master::Update::get_param("staticdir", $dbh);
+		my $filename = "$staticdir/$page";
 		my $fh = new IO::File("$filename");
 
 		if (! $fh) {
@@ -113,7 +121,6 @@ sub handle_request
 	$path =~ s,/$,,;
 
 	# Ok, now SQL is needed to go further
-	use Munin::Master::Update;
 	my $dbh = Munin::Master::Update::get_dbh(1);
 
 	my $comparison;
@@ -137,7 +144,7 @@ sub handle_request
 
 	# Problems nav
 	{
-		my $sth = $dbh->prepare_cached("SELECT SUM(critical), SUM(warning), SUM(unknown) FROM ds");
+		my $sth = $dbh->prepare_cached("SELECT SUM(critical), SUM(warning), SUM(unknown) FROM ds WHERE deleted = 0");
 		$sth->execute();
 		my ($critical, $warning, $unknown) = $sth->fetchrow_array;
 		$sth->finish();
@@ -148,7 +155,7 @@ sub handle_request
 
 	# Groups nav
 	{
-		my $sth = $dbh->prepare_cached("SELECT g.name, u.path FROM grp g INNER JOIN url u ON u.id = g.id AND u.type = 'group' WHERE g.p_id = 0 ORDER BY g.name ASC");
+		my $sth = $dbh->prepare_cached("SELECT g.name, u.path FROM grp g INNER JOIN url u ON u.grp_id = g.id WHERE g.p_id = 0 ORDER BY g.name ASC");
 		$sth->execute();
 
 		my $rootgroups = [];
@@ -193,9 +200,9 @@ sub handle_request
 		{
 			# Constructing the recursive datastructure.
 			# Note that it is quite naive, and not optimized for speed.
-			my $sth_grp = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.id = g.id AND u.type = 'group' AND p_id = ? ORDER BY g.name ASC");
-			my $sth_grp_root = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.id = g.id AND u.type = 'group' AND p_id = 0 ORDER BY g.name ASC");
-			my $sth_node = $dbh->prepare_cached("SELECT n.id, n.name, u.path, n.path FROM node n INNER JOIN url u ON u.id = n.id AND u.type = 'node' AND n.grp_id = ? ORDER BY n.name ASC");
+			my $sth_grp = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.grp_id = g.id AND p_id = ? ORDER BY g.name ASC");
+			my $sth_grp_root = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.grp_id = g.id AND p_id = 0 ORDER BY g.name ASC");
+			my $sth_node = $dbh->prepare_cached("SELECT n.id, n.name, u.path, n.path FROM node n INNER JOIN url u ON u.node_id = n.id AND n.grp_id = ? ORDER BY n.name ASC");
 
 			$template_params{GROUPS} = _get_params_groups($path, $dbh, $sth_grp, $sth_grp_root, $sth_node, undef, $graph_ext);
 			$template_params{NGROUPS} = scalar(@{$template_params{GROUPS}});
@@ -229,10 +236,10 @@ sub handle_request
 
 		my $sth = $dbh->prepare_cached("SELECT nu.path, n.name, su.path, s.name, d.critical, d.warning, d.unknown FROM ds d
 				LEFT OUTER JOIN service s ON s.id = d.service_id
-				LEFT OUTER JOIN url su ON su.id = s.id and su.type = 'service'
+				LEFT OUTER JOIN url su ON su.service_id = s.id
 				LEFT OUTER JOIN node n ON n.id = s.node_id
-				LEFT OUTER JOIN url nu ON nu.id = n.id and nu.type = 'node'
-				WHERE d.critical = 1 OR d.warning = 1 OR d.unknown = 1
+				LEFT OUTER JOIN url nu ON nu.node_id = n.id
+				WHERE (d.critical = 1 OR d.warning = 1 OR d.unknown = 1) AND d.deleted = 0
 			");
 		$sth->execute();
 
@@ -328,29 +335,30 @@ sub handle_request
 	# Remove an eventual [/index].html
 	$path =~ s/(\/index)?\.html$//;
 
-	my ($id, $type);
+	# DB CHECK constraint ensures exactly one of grp_id, node_id, service_id is set
+	my ($grp_id, $node_id, $service_id);
 	{
-		my $sth_url = $dbh->prepare_cached("SELECT id, type FROM url WHERE path = ?");
+		my $sth_url = $dbh->prepare_cached("SELECT grp_id, node_id, service_id FROM url WHERE path = ?");
 		$sth_url->execute($path);
-		($id, $type) = $sth_url->fetchrow_array;
+		($grp_id, $node_id, $service_id) = $sth_url->fetchrow_array;
 		$sth_url->finish();
 	}
 
-	if (! defined $id) {
+	if (! defined $grp_id && ! defined $node_id && ! defined $service_id) {
 		# Not found
 		print "HTTP/1.0 404 Not found\r\n";
 		goto CLEANUP;
-	} elsif ($type eq "group") {
+	} elsif (defined $grp_id) {
 		# Shared code for group views and comparison views
 
 		# Constructing the recursive datastructure.
 		# Note that it is quite naive, and not optimized for speed.
-		my $sth_grp = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.id = g.id AND u.type = 'group' AND p_id = ? ORDER BY g.name ASC");
-		my $sth_grp_root = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.id = g.id AND u.type = 'group' AND p_id = 0 ORDER BY g.name ASC");
-		my $sth_node = $dbh->prepare_cached("SELECT n.id, n.name, u.path, n.path FROM node n INNER JOIN url u ON u.id = n.id AND u.type = 'node' AND n.grp_id = ? ORDER BY n.name ASC");
+		my $sth_grp = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.grp_id = g.id AND p_id = ? ORDER BY g.name ASC");
+		my $sth_grp_root = $dbh->prepare_cached("SELECT g.id, g.name, u.path FROM grp g INNER JOIN url u ON u.grp_id = g.id AND p_id = 0 ORDER BY g.name ASC");
+		my $sth_node = $dbh->prepare_cached("SELECT n.id, n.name, u.path, n.path FROM node n INNER JOIN url u ON u.node_id = n.id AND n.grp_id = ? ORDER BY n.name ASC");
 
 		my $sth_p_id = $dbh->prepare_cached("SELECT g.p_id FROM grp g WHERE g.id = ?");
-		$sth_p_id->execute($id);
+		$sth_p_id->execute($grp_id);
 		my ($_p_id) = $sth_p_id->fetchrow_array;
 		$sth_p_id->finish();
 		my $sth_peer;
@@ -358,7 +366,7 @@ sub handle_request
 		# Check for top level groups
 		if (defined $_p_id) {
 			$sth_peer = $sth_grp;
-			$sth_peer->execute($id);
+			$sth_peer->execute($grp_id);
 		} else {
 			$sth_peer = $sth_grp_root;
 			$sth_peer->execute();
@@ -397,11 +405,11 @@ sub handle_request
 				INNER JOIN service s ON s.node_id = n.id
 				INNER JOIN service_categories sa_c ON sa_c.id = s.id
 				WHERE n.grp_id = ? ORDER BY sa_c.category ASC");
-			$sth_cat->execute($id);
+			$sth_cat->execute($grp_id);
 
 			$template_params{CATEGORIES} = [];
 			while (my ($cat_name) = $sth_cat->fetchrow_array) {
-				push @{$template_params{CATEGORIES}}, _get_params_services_for_comparison($path, $dbh, $cat_name, $id, $graph_ext, $comparison);
+				push @{$template_params{CATEGORIES}}, _get_params_services_for_comparison($path, $dbh, $cat_name, $grp_id, $graph_ext, $comparison);
 			}
 
 			# Force-reduce navigation panel
@@ -412,7 +420,7 @@ sub handle_request
 			$template_filename = 'munin-domainview.tmpl';
 
 			# Main page
-			$template_params{GROUPS} = _get_params_groups($path, $dbh, $sth_grp, $sth_grp_root, $sth_node, $id, $graph_ext);
+			$template_params{GROUPS} = _get_params_groups($path, $dbh, $sth_grp, $sth_grp_root, $sth_node, $grp_id, $graph_ext);
 			$template_params{NGROUPS} = scalar(@{$template_params{GROUPS}});
 
 			# Shows "[ d w m y ]"
@@ -421,17 +429,17 @@ sub handle_request
 				1 < scalar grep { defined($_->{'NCATEGORIES'}) && $_->{'NCATEGORIES'} } @{$template_params{GROUPS}};
 		}
 
-	} elsif ($type eq "node") {
+	} elsif (defined $node_id) {
 		# Emit node template
 		$template_filename = 'munin-nodeview.tmpl';
 
 		# Construct list of peers
 		my $sth_peer = $dbh->prepare_cached(
 			"SELECT n.name, u.path FROM node n
-			INNER JOIN url u ON n.id = u.id AND u.type = 'node'
+			INNER JOIN url u ON u.node_id = n.id
 			WHERE n.grp_id = (SELECT n.grp_id FROM node n WHERE n.id = ?)
 			ORDER BY n.name ASC");
-		$sth_peer->execute($id);
+		$sth_peer->execute($node_id);
 
 		my $peers = [];
 		while (my ($_name, $_url) = $sth_peer->fetchrow_array) {
@@ -447,11 +455,11 @@ sub handle_request
 			INNER JOIN service_categories sc ON sc.id = s.id
 			WHERE s.node_id = ?
 			ORDER BY graph_category");
-		$sth_category->execute($id);
+		$sth_category->execute($node_id);
 
 		my $categories = [];
 		while (my ($_category_name) = $sth_category->fetchrow_array) {
-			push @$categories, _get_params_services($path, $dbh, $_category_name, undef, $id, $graph_ext);
+			push @$categories, _get_params_services($path, $dbh, $_category_name, undef, $node_id, $graph_ext);
 		}
 
 		$template_params{CATEGORIES} = $categories;
@@ -465,29 +473,30 @@ sub handle_request
 
 		$template_params{NAME} = $template_params{PATH}[-1]{'pathname'};
 
-	} elsif ($type eq "service") {
+	} else {  # service_id (CHECK constraint ensures one is set)
 		# Emit service template
 		$template_filename = 'munin-serviceview.tmpl';
 
 		my $sth;
 
 		$sth = $dbh->prepare_cached("SELECT name,service_title,graph_info,subgraphs,category,
-									(SELECT MAX(warning) FROM ds WHERE service_id = service.id) as state_warning,
-									(SELECT MAX(critical) FROM ds WHERE service_id = service.id) as state_critical
+									(SELECT MAX(warning) FROM ds WHERE service_id = service.id AND deleted = 0) as state_warning,
+									(SELECT MAX(critical) FROM ds WHERE service_id = service.id AND deleted = 0) as state_critical
 									FROM service
 									LEFT JOIN service_categories ON service.id = service_categories.id
 									WHERE service.id = ?");
-		$sth->execute($id);
+		$sth->execute($service_id);
 		my ($graph_name, $graph_title, $graph_info, $multigraph, $category, $state_warning, $state_critical) = $sth->fetchrow_array();
 		$sth->finish();
 
 		$sth = $dbh->prepare_cached("SELECT category FROM service_categories WHERE id = ?");
-		$sth->execute($id);
+		$sth->execute($service_id);
 		my ($graph_category) = $sth->fetchrow_array();
 		$sth->finish();
+		$graph_category //= 'other';
 
 		$sth = $dbh->prepare_cached("SELECT n.id FROM node n INNER JOIN service s ON s.node_id = n.id WHERE s.id = ?");
-		$sth->execute($id);
+		$sth->execute($service_id);
 		my ($node_id) = $sth->fetchrow_array();
 		$sth->finish();
 
@@ -522,7 +531,7 @@ sub handle_request
 
 		# Create the params
 		my %service_template_params;
-		$service_template_params{FIELDINFO} = _get_params_fields($dbh, $id);
+		$service_template_params{FIELDINFO} = _get_params_fields($dbh, $service_id);
 		my $cgi_graph_url = '/';
 		my $epoch_now = time;
 		my %epoch_start = (
@@ -569,7 +578,7 @@ RENDERING:
 		print $cgi->header( "-Content-Type" => "text/html",
 			-Cache_Control => "public, max-age=3600", # 1h for HTML pages
 		);
-		my $tmpldir = get_param("tmpldir");
+		my $tmpldir = Munin::Master::Update::get_param("tmpldir", $dbh);
 		my $template = HTML::Template::Pro->new(
 			filename => "$tmpldir/$template_filename",
 			loop_context_vars => 1,
@@ -691,10 +700,10 @@ sub _get_params_services_for_comparison {
 	# Get node and service pairs
 	my $sth_node = $dbh->prepare_cached(
 		"SELECT n.name, u.path, s.path, s.title FROM node n
-		INNER JOIN url u ON u.id = n.id AND u.type = 'node'
+		INNER JOIN url u ON u.node_id = n.id
 		LEFT JOIN
 			( SELECT s.id AS id, s.node_id AS node_id, s.service_title AS title, u_s.path AS path FROM service s
-			INNER JOIN url u_s ON s.id = u_s.id AND u_s.type = 'service'
+			INNER JOIN url u_s ON u_s.service_id = s.id
 			WHERE s.name = ? ) AS s ON n.id = s.node_id
 		WHERE n.grp_id = ?
 		ORDER BY n.name, s.title ASC");
@@ -742,9 +751,9 @@ sub _get_params_services_by_name {
 		"SELECT s.id, s.service_title as service_title, s.subgraphs as subgraphs, u.path AS url,
 		n.name AS node_name, u_n.path AS node_url
 		FROM service s
-		INNER JOIN url u ON u.id = s.id AND u.type = 'service'
+		INNER JOIN url u ON u.service_id = s.id
 		INNER JOIN node n ON n.id = s.node_id
-		INNER JOIN url u_n ON u_n.id = s.node_id AND u_n.type = 'node'
+		INNER JOIN url u_n ON u_n.node_id = s.node_id
 		WHERE s.name = ?
 		ORDER BY node_name ASC");
 	$sth->execute($service_name);
@@ -774,11 +783,11 @@ sub _get_params_services {
 	my ($base_path, $dbh, $category_name, $multigraph_parent, $node_id, $graph_ext) = @_;
 
 	my $sth = $dbh->prepare_cached("SELECT s.id, s.name, s.service_title as service_title, s.subgraphs as subgraphs, u.path AS url,
-									(SELECT MAX(warning) FROM ds WHERE service_id = s.id) as state_warning,
-									(SELECT MAX(critical) FROM ds WHERE service_id = s.id) as state_critical
+									(SELECT MAX(warning) FROM ds WHERE service_id = s.id AND deleted = 0) as state_warning,
+									(SELECT MAX(critical) FROM ds WHERE service_id = s.id AND deleted = 0) as state_critical
 		FROM service s
 		INNER JOIN service_categories sa_c ON sa_c.id = s.id AND sa_c.category = ?
-		INNER JOIN url u ON u.id = s.id AND u.type = 'service'
+		INNER JOIN url u ON u.service_id = s.id
 		WHERE s.node_id = ?
 		AND EXISTS (select sa.id from service_attr sa where sa.id = s.id)
 		ORDER BY service_title ASC");
@@ -830,7 +839,7 @@ sub _get_params_fields {
 		LEFT JOIN ds_attr a_w ON ds.id = a_w.id AND a_w.name = 'warning'
 		LEFT JOIN ds_attr a_c ON ds.id = a_c.id AND a_c.name = 'critical'
 		LEFT JOIN ds_attr a_i ON ds.id = a_i.id AND a_i.name = 'info'
-		WHERE ds.service_id = ?
+		WHERE ds.service_id = ? AND ds.deleted = 0
 		ORDER BY ds.id ASC");
 	$sth_ds->execute($service_id);
 
@@ -855,18 +864,6 @@ sub _get_params_fields {
 	}
 
 	return \@fields;
-}
-
-sub get_param
-{
-	my ($param) = @_;
-
-	# Ok, now SQL is needed to go further
-        use DBI;
-	my $datafilename = $ENV{MUNIN_DBURL} || "$Munin::Common::Defaults::MUNIN_DBDIR/datafile.sqlite";
-	my $dbh = Munin::Master::Update::get_dbh(1);
-	my ($value) = $dbh->selectrow_array("SELECT value FROM param WHERE name = ?", undef, ($param));
-	return $value;
 }
 
 sub url_to_path

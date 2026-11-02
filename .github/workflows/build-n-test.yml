@@ -1,63 +1,327 @@
-# This is a basic workflow to help you get started with Actions
-
 name: CI
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the master branch
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # Build the dev image exactly once per run; every other job loads it
+  # from this artifact. Per-job actions/cache would race on a
+  # Dockerfile change: parallel jobs all miss and all rebuild.
+  dev-image:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v6
-      - name: Fetch the deps
-        run: sudo dev_scripts/deps
-        
-      - run: perl -V
+      - uses: actions/checkout@v7
 
       - name: Cache Devel-Cover-Report-Coveralls
-        id: cache-Devel-Cover-Report-Coveralls
-        uses: actions/cache@v5
-        env:
-          cache-name: cache-Devel-Cover-Report-Coveralls
+        id: cache-coveralls-deb
+        uses: actions/cache@v6
         with:
-          # npm cache files are stored in `~/.npm` on Linux/macOS
-          path: /tmp/Devel-Cover-Report-Coveralls
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-0.32
+          path: /tmp/coveralls-deb
+          key: ${{ runner.os }}-coveralls-deb-0.32
 
-      - if: ${{ steps.cache-Devel-Cover-Report-Coveralls.outputs.cache-hit != 'true' }}
-        name: List the state of node modules
-        continue-on-error: true
+      - if: ${{ steps.cache-coveralls-deb.outputs.cache-hit != 'true' }}
+        name: Build Devel-Cover-Report-Coveralls .deb
         run: |
-          mkdir -p /tmp/Devel-Cover-Report-Coveralls
-          sudo apt-get install -y dh-make-perl libdevel-cover-perl libhttp-tiny-perl libio-socket-ssl-perl libjson-pp-perl libyaml-perl libmodule-build-tiny-perl
-          cd /tmp/Devel-Cover-Report-Coveralls && wget https://cpan.metacpan.org/authors/id/M/MI/MIKIHOSHI/Devel-Cover-Report-Coveralls-0.32.tar.gz
-          cd /tmp/Devel-Cover-Report-Coveralls && tar zxvf Devel-Cover-Report-Coveralls-0.32.tar.gz
-          cd /tmp/Devel-Cover-Report-Coveralls && DEB_BUILD_OPTIONS=nocheck dh-make-perl make --build Devel-Cover-Report-Coveralls-0.32
-          
-      - name: Devel-Cover-Report-Coveralls install the package
-        run: cd /tmp/Devel-Cover-Report-Coveralls && sudo dpkg -i libdevel-cover-report-coveralls-perl*.deb
-      - name: Devel-Cover-Report-Coveralls install any needed deps
-        run: sudo apt-get install -yf libyaml-perl
-        
-      - name: Setup the mock hostname
-        run: echo "127.0.0.1	testing.acme.com" | sudo tee -a /etc/hosts
-        
-      - name: Compute coverage 
+          mkdir -p /tmp/coveralls-deb
+          sudo apt-get update && sudo apt-get install -y dh-make-perl libdevel-cover-perl libhttp-tiny-perl libio-socket-ssl-perl libjson-pp-perl libyaml-perl libmodule-build-tiny-perl
+          cd /tmp/coveralls-deb
+          wget -q https://cpan.metacpan.org/authors/id/M/MI/MIKIHOSHI/Devel-Cover-Report-Coveralls-0.32.tar.gz
+          tar xzf Devel-Cover-Report-Coveralls-0.32.tar.gz
+          cd Devel-Cover-Report-Coveralls-0.32
+          DEB_BUILD_OPTIONS=nocheck dh-make-perl --build .
+
+      - name: Copy .deb to build context
+        run: |
+          if ls /tmp/coveralls-deb/libdevel-cover-report-coveralls-perl*.deb 1>/dev/null 2>&1; then
+            cp /tmp/coveralls-deb/libdevel-cover-report-coveralls-perl*.deb .
+          else
+            touch libdevel-cover-report-coveralls-perl.deb.dummy
+          fi
+
+      - name: Build dev container
+        run: |
+          docker build -t munin-dev -f Dockerfile.dev .
+          docker save munin-dev | gzip > /tmp/munin-dev.tar.gz
+
+      - name: Upload dev container
+        uses: actions/upload-artifact@v7
+        with:
+          name: munin-dev-image
+          path: /tmp/munin-dev.tar.gz
+
+  # Lint -- the serial gate for everything below: fast and
+  # deterministic, so a lint failure must not spend three covered
+  # matrix jobs (~20 min each) discovering what lint already knew.
+  # Branch protection gates the whole pipeline, so job/check renames
+  # here do not affect PR gating.
+  lint:
+    needs: dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load dev container
+        uses: actions/download-artifact@v8
+        with:
+          name: munin-dev-image
+          path: /tmp
+      - run: gunzip -c /tmp/munin-dev.tar.gz | docker load
+
+      - name: Lint
+        run: make docker-lint
+
+  # Full test matrix: one make invocation per test configuration, run
+  # under Devel::Cover. docker-cover IS docker-test with coverage --
+  # the same suite, so each job's pass/fail is that configuration's
+  # test verdict. Coverage run files are uploaded for the merge job;
+  # no coverage is reported per job. This is the CI half of the
+  # matrix; `make docker-test-matrix` is its local dev mirror (same
+  # configurations and arguments, sequential).
+  test:
+    needs: [dev-image, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Three of the four FORK x DBDRIVER combinations.
+        # serial+pgsql is runnable (make docker-test FORK=0
+        # DBDRIVER=pg) but unselected: no deployment shape runs it, so
+        # CI does not spend CPU cycles on it.
+        # All three run docker-cover's fixed two-pass covered shape
+        # (par pass -j4 over the non-fork tests, then seq pass -j1
+        # over the fork-mode tests -- see the Makefile), so job logs,
+        # artifacts and durations stay directly comparable across the
+        # matrix: variants differ ONLY in FORK and DBDRIVER.
+        include:
+          - config: serial-sqlite
+            make_args: "JOBS=4 FORK=0 DBDRIVER=sqlite"
+          - config: parallel-sqlite
+            make_args: "JOBS=4 FORK=1 DBDRIVER=sqlite"
+          - config: parallel-pgsql
+            make_args: "JOBS=4 FORK=1 DBDRIVER=pg"
+    steps:
+      - uses: actions/checkout@v7
+
+      # Print the runner's real hardware and limits -- on the HOST, not
+      # in the dev container (the container is pinned by Dockerfile.dev;
+      # this prints what the job actually runs on). Each matrix config
+      # gets its OWN runner instance, so this runs once per
+      # configuration: without these numbers, runner-to-runner lottery
+      # (core count, CPU model, cgroup quota, throttling, RAM) is
+      # indistinguishable from a configuration effect when comparing
+      # job durations. Context:
+      # mission_log/2026-10-04_covered_parallel_perf.md.
+      - name: Runner system info
+        run: |
+          # Diagnostics only: this step must NEVER fail the job. The
+          # default GHA shell is bash -e, and runners vary (a format
+          # field valid on one docker version may not exist on
+          # another). Failures print as text; the tests are what
+          # matter.
+          set +e
+          {
+            echo "runner: ${RUNNER_NAME:-?} arch=${RUNNER_ARCH:-?} os=${RUNNER_OS:-?}"
+            echo
+            echo "== OS / kernel =="
+            uname -a
+            grep PRETTY_NAME /etc/os-release
+            echo
+            echo "== CPU =="
+            echo -n "nproc: "
+            nproc
+            lscpu | grep -E '^(Architecture|CPU\(s\)|Model name|Thread|Core|Socket|CPU max MHz|CPU min MHz)'
+            echo
+            echo "== cgroup limits (effective ceiling for this job) =="
+            for f in cpu.max memory.max memory.current pids.max; do
+              printf '%s: ' "$f"
+              cat "/sys/fs/cgroup/$f" 2>/dev/null || echo "n/a"
+            done
+            echo "cpu.stat (throttling evidence):"
+            cat /sys/fs/cgroup/cpu.stat 2>/dev/null || echo "n/a"
+            echo
+            echo "== RAM / swap =="
+            free -m
+            echo
+            echo "== pressure (PSI): contention the kernel observed =="
+            cat /proc/pressure/cpu 2>/dev/null || echo "cpu: n/a"
+            cat /proc/pressure/memory 2>/dev/null || echo "memory: n/a"
+            echo
+            echo "== disk =="
+            df -h /
+            df -h /var/lib/docker 2>/dev/null || true
+            echo
+            echo "== docker =="
+            docker version --format '{{.Client.Version}} client / {{.Server.Version}} server ({{.Server.Os}}/{{.Server.Arch}})' 2>/dev/null || echo "docker version: n/a"
+            echo -n "storage driver: "
+            docker info --format '{{.Driver}}' 2>/dev/null || echo "n/a"
+            echo
+            echo "== fd limit =="
+            ulimit -n
+          } 2>&1
+
+          # Compact copy on the run's summary page, so durations can be
+          # read against hardware without opening a single job log.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### Runner system info (${{ matrix.config }})"
+              echo '```'
+              echo "nproc: $(nproc) | $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+              echo "cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/a)"
+              echo "memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+              free -m | awk '/^Mem:/{printf "RAM: %dMB total / %dMB free\n", $2, $7} /^Swap:/{printf "swap: %dMB total / %dMB free\n", $2, $7}'
+              df -h / | awk 'NR==2{printf "disk /: %s total / %s free (%s used)\n", $2, $4, $5}'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Load dev container
+        uses: actions/download-artifact@v8
+        with:
+          name: munin-dev-image
+          path: /tmp
+      - run: gunzip -c /tmp/munin-dev.tar.gz | docker load
+
+      - name: Test with coverage (${{ matrix.config }})
+        run: |
+          make docker-cover COVER_REPORT=0 ${{ matrix.make_args }} 2>&1 | tee test-output-${{ matrix.config }}.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Show test failures
+        if: failure()
+        run: ./script/show-test-failures test-output-${{ matrix.config }}.log
+
+      # ONE artifact per tarball, not per configuration. docker-cover
+      # produces cover_db_par.tgz + cover_db_seq.tgz (par pass + seq
+      # pass, see the Makefile), and the coverage job's unpack loop
+      # derives its target directory from the artifact NAME: two
+      # tarballs in one artifact map to one directory, and the loop's
+      # per-tarball rm -rf wipes the first extraction (seq extracts
+      # last alphabetically -> par coverage silently discarded ->
+      # Coveralls cratered; mission_log/2026-10-04 Session 2).
+      # Separate -par / -seq artifacts keep one tarball per directory:
+      # the download pattern cover-db-* and the report glob cover_db-*/
+      # then pick up every database with no coverage-job change. If a
+      # pass dies before tar'ing, its artifact stays empty
+      # (if-no-files-found: ignore) and coverage still ships the pass
+      # that completed.
+      - name: Upload coverage database (par pass)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cover-db-${{ matrix.config }}-par
+          path: cover_db_par.tgz
+          if-no-files-found: ignore
+      - name: Upload coverage database (seq pass)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cover-db-${{ matrix.config }}-seq
+          path: cover_db_seq.tgz
+          if-no-files-found: ignore
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-output-${{ matrix.config }}
+          path: test-output-${{ matrix.config }}.log
+
+  # Merge the coverage runs from every configuration into one report,
+  # and upload to Coveralls exactly once per workflow run. Coveralls
+  # treats each upload as the commit's status: parallel uploads from
+  # matrix jobs would race (last POST wins, the published number flaps
+  # between single-configuration values). The merged report is the
+  # union -- a branch covered in any configuration counts as covered.
+  # Runs even when some configurations failed: whatever ran is still
+  # worth reporting.
+  coverage:
+    needs: [dev-image, test]
+    if: always() && needs.test.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load dev container
+        uses: actions/download-artifact@v8
+        with:
+          name: munin-dev-image
+          path: /tmp
+      - run: gunzip -c /tmp/munin-dev.tar.gz | docker load
+
+      - name: Download coverage databases
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cover-db-*
+          path: .
+
+      - name: Unpack coverage databases
+        run: |
+          # Each configuration's tarball holds a COMPLETE cover_db
+          # (runs/, structure/ AND digests). The structure is written
+          # by the collection phase into the base db; a runs-only
+          # archive merges into a database the report cannot attribute
+          # -> empty report -> 0% on Coveralls with a green pipeline.
+          # Nothing is renamed: cover merges whole databases itself.
+          shopt -s nullglob
+          dbs=(cover-db-*/*.tgz)
+          if [ ${#dbs[@]} -eq 0 ]; then
+            echo "No coverage databases found (test jobs produced nothing)"
+            exit 1
+          fi
+          for tgz in "${dbs[@]}"; do
+            cfg=$(basename "$(dirname "$tgz")")
+            cfg=${cfg#cover-db-}
+            dir="cover_db-$cfg"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            tar xzf "$tgz" -C "$dir" --strip-components=1
+            echo "Unpacked $dir: $(ls "$dir" | tr '\n' ' ')"
+          done
+
+      # cover merges whole databases given as arguments: for each
+      # extra db it consumes that db's runs and merges its structure.
+      # First db is primary, the rest merge into it. Report-time
+      # select: tests load production code from lib/ via "use lib",
+      # so the database contains lib/Munin/... paths, never
+      # blib/lib/... (matching blib/ uploaded empty data to Coveralls
+      # for years while paying the full instrumentation tax).
+      - name: Report over the merged databases
+        run: |
+          dbs=(cover_db-*/)
+          dbs=("${dbs[@]%/}")
+          primary="${dbs[0]}"
+          merges="${dbs[@]:1}"
+          echo "Primary: $primary; merging:${merges}"
+          docker run --rm -v $(pwd):/app munin-dev sh -c "
+            cover -silent -select_re \"^lib/Munin|^script/munin\" \
+                  -report html_basic -outputdir cover_db $primary $merges &&
+            cover -silent -select_re \"^lib/Munin|^script/munin\" -summary $primary $merges"
+
+      - name: Upload to Coveralls
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cover -test -report coveralls
+        run: |
+          dbs=(cover_db-*/)
+          dbs=("${dbs[@]%/}")
+          primary="${dbs[0]}"
+          merges="${dbs[@]:1}"
+          docker run --rm -v $(pwd):/app -e GITHUB_TOKEN munin-dev \
+            cover -silent -select_re "^lib/Munin|^script/munin" -report coveralls $primary $merges
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: cover_db/
+
+      - name: Upload merged test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-outputs
+          path: test-output-*.log
