@@ -1,4 +1,84 @@
-FROM munin:base
+FROM debian:bookworm
 
-USER munin
-WORKDIR /munin
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cpanminus \
+    build-essential \
+    perl \
+    rrdtool \
+    rrdcached \
+    libmodule-build-perl \
+    libdbi-perl \
+    libdbd-sqlite3-perl \
+    libdbd-pg-perl \
+    libhtml-template-pro-perl \
+    libhttp-server-simple-cgi-prefork-perl \
+    libjson-perl \
+    libwww-perl \
+    liblog-dispatch-perl \
+    libnet-snmp-perl \
+    libnet-server-perl \
+    libparallel-forkmanager-perl \
+    libparams-validate-perl \
+    libxml-dumper-perl \
+    libxml-libxml-perl \
+    libxml-parser-perl \
+    libtest-most-perl \
+    libtest-differences-perl \
+    libtest-deep-perl \
+    libtest-mockmodule-perl \
+    libtest-mockobject-perl \
+    libtest-exception-perl \
+    libdevel-confess-perl \
+    libdevel-cover-perl \
+    libtemplate-perl \
+    libyaml-perl \
+    libfile-slurp-perl \
+    faketime \
+    openssl \
+    librrds-perl \
+    libssl-dev \
+    codespell \
+    shellcheck \
+    git \
+    libperl-critic-perl \
+    libnet-dns-perl \
+    libnet-ip-perl \
+    libtest-class-perl \
+    libtest-longstring-perl \
+    libtest-perl-critic-perl \
+    libio-string-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Test deps not available as .deb
+RUN cpanm --notest Directory::Scratch File::ReadBackwards IO::Scalar
+
+# Install cached .deb if present, otherwise fall back to cpanm
+COPY libdevel-cover-report-coveralls-perl*.deb* /tmp/
+RUN if ls /tmp/libdevel-cover-report-coveralls-perl*.deb 1>/dev/null 2>&1; then \
+        dpkg -i /tmp/libdevel-cover-report-coveralls-perl*.deb || apt-get install -yf; \
+        rm -f /tmp/*.deb* /tmp/*.dummy; \
+    else \
+        rm -f /tmp/*.dummy; \
+        cpanm --notest Devel::Cover::Report::Coveralls; \
+    fi
+
+# PostgreSQL server for the pg cell of the test matrix (multiprocess +
+# pgsql). In-image rather than a CI service so every environment that
+# runs docker-test exercises the Pg code paths. Trust auth on local
+# connections: this is a disposable test container, not a production
+# database. Kept as its own layer after the cached apt/cpanm layers so a
+# routine image rebuild does not redo them.
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql \
+    && sed -i -E '/^local[[:space:]]+all/ s/[[:space:]]+peer$/ trust/; /^host[[:space:]]+all/ s/[[:space:]]+(scram-sha-256|md5|peer)$/ trust/' /etc/postgresql/*/main/pg_hba.conf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Hostname mapping handled at runtime via --add-host in docker run
+
+WORKDIR /app
+
+# Always mount source: docker run -v $(pwd):/app munin-dev ...
+RUN git config --global --add safe.directory /app
+
+EXPOSE 4949 4946
+
+CMD ["./dev_scripts/all"]

@@ -98,6 +98,9 @@ time_wait.draw STACK
 syn_sent.label SYN_SENT
 syn_sent.type GAUGE
 syn_sent.draw STACK
+syn_recv.label SYN_RECV
+syn_recv.type GAUGE
+syn_recv.draw STACK
 udp.label UDP connections
 udp.type GAUGE
 udp.draw STACK
@@ -139,6 +142,7 @@ my %state = (
     'FIN_WAIT' => 0,
     'TIME_WAIT' => 0,
     'SYN_SENT' => 0,
+    'SYN_RECV' => 0,
     'UDP' => 0,
     'ASSURED' => 0,
     'NATTED' => 0,
@@ -162,6 +166,7 @@ print "established.value $state{'ESTABLISHED'}\n";
 print "fin_wait.value $state{'FIN_WAIT'}\n";
 print "time_wait.value $state{'TIME_WAIT'}\n";
 print "syn_sent.value $state{'SYN_SENT'}\n";
+print "syn_recv.value $state{'SYN_RECV'}\n";
 print "udp.value $state{'UDP'}\n";
 print "assured.value $state{'ASSURED'}\n";
 print "nated.value $state{'NATTED'}\n";

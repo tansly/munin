@@ -1,13 +1,171 @@
 use strict;
 use warnings;
 
-use lib qw(t/lib);
-
+use lib qw(lib t/lib);
 
 use Test::More;
-use Test::Differences;
+use File::Temp qw(tempdir);
+use File::Path qw(remove_tree);
+use IO::Socket::INET;
+use POSIX qw(:sys_wait_h);
 
-require_ok( 'Munin::Master::Graph' );
+require_ok('Munin::Master::Update');
+require_ok('Munin::Master::Graph');
+require_ok('Munin::Master::Static::CGI');
+
+use constant {
+	NODE_START_TIMEOUT => 30,
+	UPDATE_RUNS        => 5,
+};
+
+my @child_pids;
+my $temp_dir;
+my $TEST_PID = $$;    # END cleanup runs only in this process
+
+END {
+	# Pid-guarded: forked update workers inherit this END block
+	# (finish() -> exit() runs END in the child).  Unguarded, a worker
+	# kills the shared test nodes, deletes the state dir under the
+	# master, and -- via $? = 0 -- clobbers its own exit code so
+	# run_on_finish never sees worker failures.  Only the original
+	# test process cleans up.
+	return if $$ != $TEST_PID;
+	if (@child_pids) {
+		kill('TERM', @child_pids);
+		for my $pid (@child_pids) {
+			waitpid($pid, 0);
+		}
+	}
+	if ($temp_dir && -d $temp_dir) {
+		remove_tree($temp_dir);
+	}
+	$? = 0;
+}
+
+my $script_dir = __FILE__;
+$script_dir =~ s{/[^/]+$}{};
+my $test_node = "$script_dir/lib/node_test.pl";
+
+my @ports = get_free_ports(3);
+
+for my $port (@ports) {
+	my $pid = fork();
+	if ($pid == 0) {
+		exec("perl", $test_node, $port, "30");
+		die "exec failed: $!";
+	}
+	push @child_pids, $pid;
+}
+
+my $all_ready = wait_for_ports(\@ports, NODE_START_TIMEOUT);
+ok($all_ready, "all test nodes are listening");
+
+unless ($all_ready) {
+	kill('TERM', @child_pids);
+	die "Test nodes failed to start";
+}
+
+use TestState;
+use TestUtils;
+$temp_dir = TestState::state_dir();
+
+# Not setup_test_config(): generates its own conf with the ephemeral
+# ports the forked test nodes actually bound -- t/config/munin.conf's
+# fixed ports would collide.
+my $conf_file = TestUtils::generate_test_conf($temp_dir, \@ports);
+
+my $config = Munin::Master::Config->instance()->{"config"};
+$config->parse_config_from_file($conf_file);
+
+$config->{dbdir} = $temp_dir;
+$config->{fork} = TestUtils::fork_mode();
+
+Munin::Common::Logger::configure(
+	"output" => "screen",
+	"level" => "info",
+);
+
+# alarm_or_die, not bare alarm: untrapped SIGALRM skips END, orphaned
+# test nodes hold the TAP pipe, prove wedges (see TestUtils).
+TestUtils::alarm_or_die(120);
+
+my $update = Munin::Master::Update->new();
+is($update->run(), UPDATE_RUNS, "update run populates DB");
+
+my $dbh = Munin::Master::Update::get_dbh(1);
+my $services = $dbh->selectall_arrayref(
+	"SELECT path FROM url WHERE service_id IS NOT NULL"
+);
+ok(scalar @$services > 0, "DB has services");
+
+my $path = $services->[0][0];
+my $cgi = CGI->new({ path_info => "/$path-hour.png" });
+
+my $outfile = "$temp_dir/graph_out.txt";
+do {
+	local *STDOUT;
+	open(STDOUT, '>', $outfile) or die "Cannot redirect STDOUT: $!";
+	eval { Munin::Master::Graph::handle_request($cgi) };
+	warn "handle_request died: $@" if $@;
+	close STDOUT;
+};
+
+open my $in, '<', $outfile or die "Cannot read $outfile: $!";
+local $/;
+my $output = <$in>;
+close $in;
+
+like($output, qr/HTTP\/1\.[01] 200/, "graph request returns 200 OK");
+ok(length($output) > 100, "graph output has data (" . length($output) . " bytes)");
+
+alarm(0);
+
+print "\n";
+
 done_testing();
 
 1;
+
+sub get_free_ports {
+	my ($count) = @_;
+	my @ports;
+	for (1 .. $count) {
+		my $sock = IO::Socket::INET->new(
+			LocalAddr => '127.0.0.1',
+			LocalPort => 0,
+			Proto     => 'tcp',
+		);
+		if ($sock) {
+			push @ports, $sock->sockport();
+			close($sock);
+		} else {
+			die "Cannot find free port: $!";
+		}
+	}
+	return @ports;
+}
+
+sub wait_for_ports {
+	my ($ports, $timeout) = @_;
+	my $start = time();
+
+	for my $port (@$ports) {
+		my $ready = 0;
+		while (time() - $start < $timeout) {
+			my $sock = IO::Socket::INET->new(
+				PeerAddr => '127.0.0.1',
+				PeerPort => $port,
+				Proto    => 'tcp',
+				Timeout  => 1,
+			);
+			if ($sock) {
+				close($sock);
+				$ready = 1;
+				last;
+			}
+			select(undef, undef, undef, 0.1);
+		}
+		return 0 unless $ready;
+	}
+	return 1;
+}

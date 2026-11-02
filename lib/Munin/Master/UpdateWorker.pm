@@ -15,6 +15,7 @@ use File::Spec;
 use IO::Socket::INET;
 use Munin::Master::Config;
 use Munin::Master::Node;
+use Munin::Master::Update;
 use Munin::Master::Utils;
 use RRDs;
 use Data::Dumper;
@@ -96,7 +97,7 @@ sub do_work {
 	# Having a local handle looks easier
 	my $node = $self->{node};
 
-    INFO "[INFO] starting work in $$ for $nodedesignation.\n";
+    INFO "starting work in $$ for $nodedesignation.\n";
     my $done = $node->do_in_session(sub {
 
 	# A I/O timeout results in a violent exit.  Catch and handle.
@@ -159,12 +160,12 @@ sub do_work {
 	@plugins = shuffle(@plugins);
 
 	for my $plugin (@plugins) {
-		DEBUG "[DEBUG] for my $plugin (@plugins)";
+		DEBUG "for my $plugin (@plugins)";
 		if (defined $config->{limit_services} && %{$config->{limit_services}}) {
 		    next unless $config->{limit_services}{$plugin};
 		}
 
-		DEBUG "[DEBUG] config $plugin";
+		DEBUG "config $plugin";
 
 		local $0 = "$0 c($plugin)";
 		my $update_rate = "300"; # Default
@@ -172,12 +173,12 @@ sub do_work {
 
 		# Ignoring if $last_timestamp is undef, as we don't have config
 		if (! defined ($last_timestamp)) {
-			INFO "[INFO] $plugin did emit no proper config, ignoring";
+			INFO "$plugin did emit no proper config, ignoring";
 			next;
 		}
 
 		if ($update_rate ne "300") {
-			INFO "[INFO] $plugin did change update_rate to $update_rate";
+			INFO "$plugin did change update_rate to $update_rate";
 		}
 
 		# Done with this plugin on dirty config (we already have a timestamp for data)
@@ -191,7 +192,7 @@ sub do_work {
 
 		next if ($is_fresh_enough);
 
-		DEBUG "[DEBUG] fetch $plugin";
+		DEBUG "fetch $plugin";
 		local $0 = "$0 f($plugin)";
 
 		$last_timestamp = $node->fetch_service_data($plugin,
@@ -216,22 +217,22 @@ NODE_END:
 	# XXX - investigate why this leaks here. It should be handled directly by Node.pm
 	my $node_pid = $node->{pid};
 	if ($node_pid && kill(0, $node_pid)) {
-		INFO "[INFO] Killing subprocess $node_pid";
+		INFO "Killing subprocess $node_pid";
 		kill 'KILL', $node_pid; # Using SIGKILL, since normal termination didn't happen
 	}
 
 	if ($@ =~ m/^NO_SPOOLFETCH_DATA /) {
-	    INFO "[INFO] No spoofetch data for $nodedesignation";
+	    INFO "No spoofetch data for $nodedesignation";
 	    return;
 	} elsif ($@) {
-	    ERROR "[ERROR] Error in node communication with $nodedesignation: "
+	    ERROR "Error in node communication with $nodedesignation: "
 		.$@;
 	    return;
 	}
 
 FETCH_OK:
 	# Everything went smoothly.
-	DEBUG "[DEBUG] Everything went smoothly.";
+	DEBUG "Everything went smoothly.";
 	return 1;
 
     }); # do_in_session
@@ -246,9 +247,15 @@ sub _db_url {
 	my ($self, $type, $id, $path, $p_type, $p_id) = @_;
 	my $dbh = $self->{dbh};
 
+	# Allowed column names for url table - prevents SQL injection
+	my %col_map = (group => 'grp_id', node => 'node_id', service => 'service_id');
+
 	if ($p_type) {
-		my $sth_g_url = $dbh->prepare_cached("SELECT path FROM url WHERE type = ? AND id = ?");
-		$sth_g_url->execute($p_type, $p_id);
+		my $p_col = $col_map{$p_type} or die "Unknown url type: $p_type";
+		# Validate column name is from allowed set
+		die "Invalid column" unless $p_col =~ /^(grp_id|node_id|service_id)$/;
+		my $sth_g_url = $dbh->prepare_cached("SELECT path FROM url WHERE $p_col = ?");
+		$sth_g_url->execute($p_id);
 		my ($p_path) = $sth_g_url->fetchrow_array();
 		$sth_g_url->finish();
 
@@ -256,11 +263,16 @@ sub _db_url {
 		$path = "$p_path/$path" if $p_path;
 	}
 
-	my $sth_u_url = $dbh->prepare_cached("UPDATE url SET path = ? WHERE type = ? AND id = ?");
-	my $nb_rows_affected = $sth_u_url->execute($path, $type, $id);
+	my $col = $col_map{$type} or die "Unknown url type: $type";
+	# Validate column name is from allowed set
+	die "Invalid column" unless $col =~ /^(grp_id|node_id|service_id)$/;
+
+	# Try UPDATE first, then INSERT
+	my $sth_u_url = $dbh->prepare_cached("UPDATE url SET path = ? WHERE $col = ?");
+	my $nb_rows_affected = $sth_u_url->execute($path, $id);
 	unless ($nb_rows_affected > 0) {
-		my $sth_url = $dbh->prepare_cached('INSERT INTO url (type, id, path) VALUES (?, ?, ?)');
-		$sth_url->execute($type, $id, $path);
+		my $sth_url = $dbh->prepare_cached("INSERT INTO url (path, $col) VALUES (?, ?)");
+		$sth_url->execute($path, $id);
 	}
 }
 
@@ -300,7 +312,12 @@ sub _db_mkgrp {
 		# Removal of grp is *unsupported* yet.
 	}
 
-	$self->_db_url("group", $grp_id, $grp_name);
+	# Pass parent info to build full path for nested groups
+	if ($p_id) {
+		$self->_db_url("group", $grp_id, $grp_name, "group", $p_id);
+	} else {
+		$self->_db_url("group", $grp_id, $grp_name);
+	}
 
 	return $grp_id;
 }
@@ -364,7 +381,7 @@ sub _db_service {
 	DEBUG "_db_service.service_id:$service_id";
 
 	# Save the existing values
-	my (%service_attrs_old, %fields_old);
+	my (%service_attrs_old, %fields_old, %deleted_old);
 	{
 		my $sth_service_attrs = $dbh->prepare_cached("SELECT name, value FROM service_attr WHERE id = ?");
 		$sth_service_attrs->execute($service_id);
@@ -374,13 +391,13 @@ sub _db_service {
 		}
 		$sth_service_attrs->finish();
 
-		my $sth_fields_attr = $dbh->prepare_cached("SELECT ds.name as field, ds_attr.name as attr, ds_attr.value FROM ds
+		my $sth_fields_attr = $dbh->prepare_cached("SELECT ds.name as field, ds_attr.name as attr, ds_attr.value, ds.deleted FROM ds
 			LEFT OUTER JOIN ds_attr ON ds.id = ds_attr.id WHERE ds.service_id = ?");
 		$sth_fields_attr->execute($service_id);
 
-		my %fields_old;
-		while (my ($_field, $_name, $_value) = $sth_fields_attr->fetchrow_array()) {
-			$fields_old{$_field}{$_name} = $_value;
+		while (my ($_field, $_name, $_value, $_deleted) = $sth_fields_attr->fetchrow_array()) {
+			$fields_old{$_field}{$_name} = $_value if defined $_name;
+			$deleted_old{$_field} = $_deleted || 0;
 		}
 		$sth_fields_attr->finish();
 	}
@@ -388,54 +405,55 @@ sub _db_service {
 	DEBUG "_db_service.%service_attrs_old:" . Dumper(\%service_attrs_old);
 	DEBUG "_db_service.%fields_old:" . Dumper(\%fields_old);
 
-	# Leave room for refresh
-	# XXX - we might only update DB with diff.
-	my $sth_service_attrs_del = $dbh->prepare_cached("DELETE FROM service_attr WHERE id = ?");
-	$sth_service_attrs_del->execute($service_id);
+	# Diff and apply service_attr changes
+	$self->_db_diff_attrs('service_attr', 'id', $service_id, \%service_attrs_old, $service_attr);
 
-	for my $attr (keys %$service_attr) {
-		my $_service_value = $service_attr->{$attr};
-		$self->_db_service_attr($service_id, $attr, $_service_value);
-	}
-
-	# Handle the service_category
+	# Handle the service_category (diff: insert/update as needed)
+	# Default category is 'other' per spec: if plugin doesn't declare
+	# graph_category, it goes to 'other'
 	{
-		my $category = $service_attr->{graph_category} || "other";
+		my $category = $service_attr->{graph_category} || 'other';
 
-		# XXX - might only INSERT IT IF NOT PRESENT
-		my $sth_service_cat_del = $dbh->prepare_cached("DELETE FROM service_categories WHERE id = ? and category = ?");
-		$sth_service_cat_del->execute($service_id, $category);
+		# Read current category
+		my $sth_cat_old = $dbh->prepare_cached("SELECT category FROM service_categories WHERE id = ?");
+		$sth_cat_old->execute($service_id);
+		my ($old_category) = $sth_cat_old->fetchrow_array();
+		$sth_cat_old->finish();
 
-		my $sth_service_cat = $dbh->prepare_cached("INSERT INTO service_categories (id, category) VALUES (?, ?)");
-		$sth_service_cat->execute($service_id, $category);
+		if (!defined $old_category) {
+			my $sth_cat_ins = $dbh->prepare_cached("INSERT INTO service_categories (id, category) VALUES (?, ?)");
+			$sth_cat_ins->execute($service_id, $category);
+		} elsif ($old_category ne $category) {
+			my $sth_cat_upd = $dbh->prepare_cached("UPDATE service_categories SET category = ? WHERE id = ?");
+			$sth_cat_upd->execute($category, $service_id);
+		}
 	}
 
-	# Handle the fields
-
-	# Remove the ds_attr rows
-	{
-		my $sth_del_attr = $dbh->prepare_cached('DELETE FROM ds_attr WHERE id IN (SELECT id FROM ds WHERE service_id = ?)');
-		$sth_del_attr->execute($service_id);
-	}
+	# Handle the fields - diff and apply ds_attr changes
 
 	my %ds_ids;
 	for my $field_name (keys %$fields) {
 		my $_field_attrs = $fields->{$field_name};
 
-
-		my $ds_id = $self->_db_ds_update($service_id, $field_name, $_field_attrs);
+		my $ds_id = $self->_db_ds_update($service_id, $field_name, $_field_attrs, $fields_old{$field_name} // {});
 		$ds_ids{$field_name} = $ds_id;
 	}
 
-	# Purge the ds that have no attributes, as they are not relevant anymore
-	{
-		my $sth_del_ds = $dbh->prepare_cached('DELETE FROM ds WHERE service_id = ? AND NOT EXISTS (SELECT * FROM ds_attr WHERE ds_attr.id = ds.id)');
-		$sth_del_ds->execute($service_id);
+	# Soft-delete datasources that are no longer in the config: keep the
+	# row, its attributes, its RRD mapping and its state -- the update
+	# path simply stops writing for them, and a field that reappears
+	# resurrects with continuous RRD history.
+	for my $old_field (keys %fields_old) {
+		next if exists $fields->{$old_field};
+		next if $deleted_old{$old_field};
+		DEBUG "_db_service: soft-deleting stale ds '$old_field' from service $service_id";
+		$dbh->prepare_cached('UPDATE ds SET deleted = 1 WHERE service_id = ? AND name = ?')
+			->execute($service_id, $old_field);
 	}
 
 	# Update the ordering of fields
 	{
-		my @graph_order = split(/ /, $service_attr->{graph_order});
+		my @graph_order = split(/ /, $service_attr->{graph_order} // '');
 		DEBUG "_db_service.graph_order: @graph_order";
 		my $ordr = 0;
 		for my $_name (@graph_order) {
@@ -453,22 +471,52 @@ sub _db_service {
 	return ($service_id, \%service_attrs_old, \%fields_old, \%ds_ids);
 }
 
-sub _db_service_attr {
-	my ($self, $service_id, $name, $value) = @_;
+sub _db_diff_attrs {
+	my ($self, $table, $id_col, $id, $attrs_old, $attrs_new) = @_;
 	my $dbh = $self->{dbh};
 
-	DEBUG "_db_service_attr($service_id, $name, $value)";
+	# Security gate: only allow known table/id_col combinations
+	my %allowed = (
+		'service_attr.id' => 1,
+		'ds_attr.id' => 1,
+	);
+	die "_db_diff_attrs: invalid table '$table' id_col '$id_col'"
+		unless $allowed{"$table.$id_col"};
 
-	# Save the whole service config, and drop it.
-	my $sth_service_attr = $dbh->prepare_cached("INSERT INTO service_attr (id, name, value) VALUES (?, ?, ?)");
-	$sth_service_attr->execute($service_id, $name, $value);
+	DEBUG "_db_diff_attrs($table, $id_col, $id)";
+
+	my $sth_up = $dbh->prepare_cached("UPDATE $table SET value = ? WHERE $id_col = ? AND name = ?");
+	my $sth_ins = $dbh->prepare_cached("INSERT INTO $table ($id_col, name, value) VALUES (?, ?, ?)");
+	my $sth_del = $dbh->prepare_cached("DELETE FROM $table WHERE $id_col = ? AND name = ?");
+
+	# Insert/Update new attrs
+	for my $name (keys %$attrs_new) {
+		my $value = $attrs_new->{$name};
+		if (exists $attrs_old->{$name}) {
+			if ($attrs_old->{$name} ne $value) {
+				$sth_up->execute($value, $id, $name);
+				DEBUG "_db_diff_attrs: updated $table.$id_col=$id name=$name";
+			}
+		} else {
+			$sth_ins->execute($id, $name, $value);
+			DEBUG "_db_diff_attrs: inserted $table.$id_col=$id name=$name";
+		}
+	}
+
+	# Delete removed attrs
+	for my $name (keys %$attrs_old) {
+		unless (exists $attrs_new->{$name}) {
+			$sth_del->execute($id, $name);
+			DEBUG "_db_diff_attrs: deleted $table.$id_col=$id name=$name";
+		}
+	}
 }
 
 sub _db_ds_update {
-	my ($self, $service_id, $field_name, $attrs) = @_;
+	my ($self, $service_id, $field_name, $attrs_new, $attrs_old) = @_;
 	my $dbh = $self->{dbh};
 
-	DEBUG "_db_ds_update($service_id, $field_name, $attrs)";
+	DEBUG "_db_ds_update($service_id, $field_name)";
 
 	my $sth_id = $dbh->prepare_cached("SELECT id FROM ds WHERE service_id = ? AND name = ?");
 	$sth_id->execute($service_id, $field_name);
@@ -481,16 +529,54 @@ sub _db_ds_update {
 		my $sth_ds = $dbh->prepare_cached("INSERT INTO ds (service_id, name) VALUES (?, ?)");
 		$sth_ds->execute($service_id, $field_name);
 		$ds_id = _get_last_insert_id($dbh, "ds");
+	} else {
+		# Resurrect a soft-deleted field that reappeared in the config
+		$dbh->prepare_cached('UPDATE ds SET deleted = 0 WHERE id = ? AND deleted = 1')
+			->execute($ds_id);
 	}
 
-	# Reinsert the other rows
-	my $sth_ds_attr = $dbh->prepare_cached('INSERT INTO ds_attr (id, name, value) VALUES (?, ?, ?)');
-	for my $field_attr (keys %$attrs) {
-		my $_value = $attrs->{$field_attr};
-		$sth_ds_attr->execute($ds_id, $field_attr, $_value);
+	# Apply config overrides (wins over node-reported values)
+	# Get host and service names for override lookup
+	my ($node_name, $service_name) = $self->_get_names_for_ds($ds_id);
+	if (defined $node_name) {
+		for my $attr (keys %$attrs_new) {
+			my $override = Munin::Master::Update::get_override(
+				$node_name, $service_name, $field_name, $attr, $dbh
+			);
+			if (defined $override) {
+				DEBUG "_db_ds_update: override $attr: $attrs_new->{$attr} -> $override";
+				$attrs_new->{$attr} = $override;
+			}
+		}
 	}
+
+	# Diff and apply ds_attr changes
+	$self->_db_diff_attrs('ds_attr', 'id', $ds_id, $attrs_old, $attrs_new);
 
 	return $ds_id;
+}
+
+# Get node name and service name for a ds_id (for override lookup)
+# Returns empty list if tables don't exist yet (tests, fresh installs)
+sub _get_names_for_ds {
+	my ($self, $ds_id) = @_;
+	my $dbh = $self->{dbh};
+
+	my ($node_name, $service_name);
+	eval {
+		my $sth = $dbh->prepare_cached("
+			SELECT n.name, s.name
+			FROM ds d
+			INNER JOIN service s ON s.id = d.service_id
+			INNER JOIN node n ON n.id = s.node_id
+			WHERE d.id = ?
+		");
+		$sth->execute($ds_id);
+		($node_name, $service_name) = $sth->fetchrow_array();
+		$sth->finish();
+	};
+
+	return ($node_name, $service_name);
 }
 
 sub _db_state_update {
@@ -503,7 +589,7 @@ sub _db_state_update {
 	my $sth_ds = $dbh->prepare_cached("
 		SELECT ds.id FROM ds
 		JOIN service s ON ds.service_id = s.id AND s.node_id = ? AND s.name = ?
-		WHERE ds.name = ?");
+		WHERE ds.name = ? AND ds.deleted = 0");
 	$sth_ds->execute($node_id, $plugin, $field);
 	my ($ds_id) = $sth_ds->fetchrow_array();
 	DEBUG "_db_state_update.ds_id:$ds_id";
@@ -512,13 +598,16 @@ sub _db_state_update {
 			                WHERE ds.name = '$field'" unless $ds_id;
 	$sth_ds->finish();
 
+	return unless defined $ds_id;
+
 	# Update the state with the new values
-	my $sth_state_u = $dbh->prepare_cached("UPDATE state SET prev_epoch = last_epoch, prev_value = last_value, last_epoch = ?, last_value = ? WHERE id = ? AND type = ?");
-	my $rows_u = $sth_state_u->execute($when, $value, $ds_id, "ds");
+	my $sth_state_u = $dbh->prepare_cached("UPDATE state SET prev_epoch = last_epoch, prev_value = last_value, last_epoch = ?, last_value = ? WHERE ds_id = ?");
+	my $rows_u = $sth_state_u->execute($when, $value, $ds_id);
 	if ($rows_u eq "0E0") {
 		# No line exists yet. Create It.
-		my $sth_state_i = $dbh->prepare_cached("INSERT INTO state (id, type) VALUES (?, ?)");
-		$sth_state_i->execute($ds_id, "ds");
+		my $sth_state_i = $dbh->prepare_cached("INSERT INTO state (ds_id) VALUES (?)");
+		$sth_state_i->execute($ds_id);
+		$sth_state_u->execute($when, $value, $ds_id);
 	}
 
 	return $ds_id;
@@ -557,7 +646,7 @@ sub get_spoolfetch_timestamp {
 	# 0 if unset
 	$last_updated_value = 0 unless $last_updated_value;
 
-	DEBUG "[DEBUG] get_spoolfetch_timestamp($node_id) = $last_updated_value";
+	DEBUG "get_spoolfetch_timestamp($node_id) = $last_updated_value";
 	return $last_updated_value;
 }
 
@@ -565,7 +654,7 @@ sub set_spoolfetch_timestamp {
 	my ($self, $timestamp) = @_;
 	my $dbh = $self->{dbh};
 	my $node_id = $self->{node_id};
-	DEBUG "[DEBUG] set_spoolfetch_timestamp($node_id, $timestamp)";
+	DEBUG "set_spoolfetch_timestamp($node_id, $timestamp)";
 
 	my $sth_spoolfetch = $dbh->prepare_cached("UPDATE node SET spoolepoch = ? WHERE id = ?");
 	$sth_spoolfetch->execute($timestamp, $node_id);
@@ -577,7 +666,7 @@ sub parse_update_rate {
 
 	my ($update_rate_in_sec, $is_update_aligned);
 	if ($update_rate_config =~ m/(\d+[a-z]?)(?: (.*))?/) {
-		$update_rate_in_sec = to_sec($1);
+		$update_rate_in_sec = munin_duration_to_sec($1);
 		$is_update_aligned = $2 && ($2 eq "aligned");
 	} else {
 		return (0, 0);
@@ -643,6 +732,11 @@ sub uw_handle_config {
 
 		# Handle dirty_config
 		if ($arg2 && $arg2 eq "value") {
+			# Ensure field exists in %fields so datasource gets created
+			if (!exists($fields{$arg1})) {
+				push @field_order, $arg1;
+				$fields{$arg1} = {};  # empty attrs, will get defaults
+			}
 			push @fetch_data, $line;
 			next; # Handled
 		}
@@ -681,22 +775,75 @@ sub uw_handle_config {
 	# Create/Update the service
 	my ($service_id, $service_attrs_old, $fields_old, $ds_ids) = $self->_db_service($plugin, \%service_attr, \%fields);
 
-	# Create the RRDs
+	# Create the RRDs.
+	# Fields with an established ds_rrd mapping keep it (stateful). New
+	# fields are grouped by RRD-compatibility -- same step (update_rate)
+	# and RRAs (graph_data_size) -- and share one multi-DS RRD file per
+	# group when possible. RRDtool cannot add a DS to an existing file,
+	# so fields appearing later fall back to a per-field file.
+	#
+	# The mapping lives in ds_rrd (regular columns): the plugin-config
+	# attribute diff never touches that table, so mappings cannot be lost
+	# between cycles and late fields cannot be regrouped into a multi-DS
+	# file that does not hold their DS.
+	my $dbh = $self->{dbh};
+	my $sth_mapped = $dbh->prepare_cached('SELECT 1 FROM ds_rrd WHERE ds_id = ?');
+
+	my @new_fields;    # ds_names without an established ds_rrd mapping
 	for my $ds_name (keys %fields) {
+		$sth_mapped->execute($ds_ids->{$ds_name});
+		my ($mapped) = $sth_mapped->fetchrow_array;
+		$sth_mapped->finish();
+		push @new_fields, $ds_name unless $mapped;
+	}
+
+	# Group new fields by RRD-compatibility. Type/min/max are per-DS and
+	# can differ inside a group; step & RRAs cannot.
+	my %groups;    # group key => [ [ds_name, ds_config], ... ]
+	for my $ds_name (@new_fields) {
 		# Merge attributes from ds & service
 		my $ds_config = { %service_attr, %{$fields{$ds_name}} };
-		my $ds_id = $ds_ids->{$ds_name};
-
-		my $first_epoch = time - (12 * 3600); # XXX - we should be able to have some delay in the past for spoolfetched plugins
-		my $rrd_file = $self->_create_rrd_file_if_needed($plugin, $ds_name, $ds_config, $first_epoch);
-
-		# Update the RRD file
-		# XXX - Should be handled in a stateful way, as now it is reconstructed every time
-		my $dbh = $self->{dbh};
-		my $sth_ds_attr = $dbh->prepare_cached('INSERT INTO ds_attr (id, name, value) VALUES (?, ?, ?)');
-		$sth_ds_attr->execute($ds_id, "rrd:file", $rrd_file);
-		$sth_ds_attr->execute($ds_id, "rrd:field", "42");
+		push @{$groups{$self->_get_rrd_group_key($ds_config)}}, [$ds_name, $ds_config];
 	}
+
+	# Deterministic group order, hence deterministic file naming
+	my @group_keys = sort keys %groups;
+
+	my $first_epoch = time - (12 * 3600); # XXX - we should be able to have some delay in the past for spoolfetched plugins
+
+	my %new_rrd_file;    # ds_name => rrd file of the new fields
+	my $multi_group_nb = 0;
+	for my $key (@group_keys) {
+		my $group = $groups{$key};
+		if (@$group > 1) {
+			# Multi-DS: one file for all compatible fields of the service
+			$multi_group_nb++;
+			my $suffix = $multi_group_nb > 1 ? "-$multi_group_nb" : "";
+			my $rrd_file = $self->_get_rrd_group_file_name($plugin, $suffix);
+			$self->_create_rrd_file_if_needed($rrd_file, $plugin, $group, $first_epoch);
+			$new_rrd_file{$_->[0]} = $rrd_file for @$group;
+		} else {
+			# Single field: keep the traditional per-field file
+			my ($ds_name, $ds_config) = @{$group->[0]};
+			my $rrd_file = $self->_get_rrd_file_name($plugin, $ds_name, $ds_config);
+			$self->_create_rrd_file_if_needed($rrd_file, $plugin, $group, $first_epoch);
+			$new_rrd_file{$ds_name} = $rrd_file;
+		}
+	}
+
+	# Stateful: store the mapping only for fields that had none
+	my $sth_map_ins = $dbh->prepare_cached('INSERT INTO ds_rrd (ds_id, file, field) VALUES (?, ?, ?)');
+	for my $ds_name (@new_fields) {
+		my $ds_config = { %service_attr, %{$fields{$ds_name}} };
+		$sth_map_ins->execute($ds_ids->{$ds_name},
+			$new_rrd_file{$ds_name},
+			$self->_get_rrd_field_name($ds_name, $ds_config));
+	}
+
+	# Note: fields that disappear from the config are soft-deleted
+	# (ds.deleted = 1) in _db_service -- their rows, attributes, RRD
+	# mappings and state are kept and the update path simply stops
+	# writing for them. There is nothing to purge here.
 
 	# timestamp == 0 means "Nothing was updated". We only count on the
 	# "fetch" part to provide us good timestamp info, as the "config" part
@@ -722,6 +869,12 @@ sub uw_handle_fetch {
 
 	# timestamp == 0 means "Nothing was updated"
 	my $last_timestamp = 0;
+
+	# Buffered RRD updates: { rrd_file => { when => { rrd_ds_name => value } } }
+	# Fields sharing a multi-DS RRD file are updated together (one RRDtool
+	# update per file & timestamp), flushed at the end of this fetch.
+	my %pending_rrd_updates;
+	my %rrd_map_cache;    # ds_id => [rrd_file, rrd_field]
 
 	$self->{dbh}->begin_work() if $self->{dbh}->{AutoCommit};
 
@@ -758,36 +911,32 @@ sub uw_handle_fetch {
 
 		# Update all data-driven components: State, RRD, Graphite
 		my $ds_id = $self->_db_state_update($plugin, $field, $when, $value);
-	        DEBUG "[DEBUG] ds_id($plugin, $field, $when, $value) = $ds_id";
+	        DEBUG "ds_id($plugin, $field, $when, $value) = $ds_id";
+		next unless defined $ds_id;
 
 		my ($rrd_file, $rrd_field);
 		{
-			# XXX - Quite inefficient, but works
-			my $dbh = $self->{dbh};
-			my $sth_rrdinfos = $dbh->prepare_cached(
-				"SELECT name, value FROM ds_attr WHERE id = ? AND name in (
-					'rrd:file',
-					'rrd:field'
-				)"
-			);
-			$sth_rrdinfos->execute($ds_id);
-			while ( my @row = $sth_rrdinfos->fetchrow_array ) {
-				$rrd_file  = $row[1] if $row[0] eq "rrd:file";
-				$rrd_field = $row[1] if $row[0] eq "rrd:field";
+			# ds_rrd holds the file/DS mapping; memoize it per fetch
+			unless (exists $rrd_map_cache{$ds_id}) {
+				my $sth_map = $self->{dbh}->prepare_cached(
+					'SELECT file, field FROM ds_rrd WHERE ds_id = ?');
+				$sth_map->execute($ds_id);
+				my @row = $sth_map->fetchrow_array;
+				$sth_map->finish();
+				$rrd_map_cache{$ds_id} = \@row;
 			}
-			$sth_rrdinfos->finish();
+			($rrd_file, $rrd_field) = @{$rrd_map_cache{$ds_id}};
 		}
 
-		# This is a little convoluted but is needed as the API permits
-		# vectorized updates
-		my $ds_values = {
-			"value" => [ $value, ],
-			"when" => [ $when, ],
-		};
-		DEBUG "[DEBUG] self->_update_rrd_file($rrd_file, $field, $ds_values";
-		$self->_update_rrd_file($rrd_file, $field, $ds_values);
-
+		# Buffer the RRD update until the whole fetch is parsed: a single
+		# RRDtool update must carry all the DS sharing one file at one
+		# timestamp.
+		next unless defined $rrd_file && defined $rrd_field;
+		$pending_rrd_updates{$rrd_file}{$when}{$rrd_field} = $value;
 	}
+
+	# Flush the buffered RRD updates in timestamp order
+	$self->_flush_rrd_updates(\%pending_rrd_updates) if %pending_rrd_updates;
 
 	$self->{dbh}->commit() unless $self->{dbh}->{AutoCommit};
 
@@ -816,14 +965,55 @@ sub _get_rrd_data_source_with_defaults {
 
 
 sub _create_rrd_file_if_needed {
-    my ($self, $service, $ds_name, $ds_config, $first_epoch) = @_;
+    my ($self, $rrd_file, $service, $ds_list, $first_epoch) = @_;
 
-    my $rrd_file = $self->_get_rrd_file_name($service, $ds_name, $ds_config);
-    unless (-f $rrd_file) {
-        $self->_create_rrd_file($rrd_file, $service, $ds_name, $ds_config, $first_epoch);
+    # $rrd_file is relative to dbdir, which is what ds_attr stores
+    unless (-f File::Spec->catfile($config->{dbdir}, $rrd_file)) {
+        $self->_create_rrd_file($rrd_file, $service, $ds_list, $first_epoch);
     }
 
     return $rrd_file;
+}
+
+
+# Multi-DS RRD file name: {host_path}-{service}.rrd, with an optional
+# disambiguating suffix (e.g. "-2") when a service has several
+# incompatible field groups.
+sub _get_rrd_group_file_name {
+    my ($self, $service, $suffix) = @_;
+
+    my $path = $self->{host}->get_full_path;
+    $path =~ s{[;:]}{/}g;
+
+    # Multigraph/nested services will have . in the service name in this function.
+    $service =~ s{\.}{-}g;
+
+    my $file = sprintf("%s-%s%s.rrd",
+                       $path,
+                       $service,
+                       $suffix // "");
+
+    DEBUG "rrd filename: $file\n";
+
+    return $file;
+}
+
+
+# Two fields can share one multi-DS RRD file only if their files would be
+# created with the same step & RRA layout. Type/min/max are per-DS and do
+# not matter for grouping.
+sub _get_rrd_group_key {
+    my ($self, $ds_config) = @_;
+
+    $ds_config = $self->_get_rrd_data_source_with_defaults($ds_config);
+    my ($update_rate_in_sec) = parse_update_rate($ds_config->{update_rate});
+    my $resolution = $ds_config->{graph_data_size};
+
+    # Mirror the step decisions in _create_rrd_file: 'normal', 'huge' and
+    # 'debug' hard-code the step to 300s
+    $update_rate_in_sec = 300 if $resolution =~ /^(normal|huge|debug)$/;
+
+    return join("|", $update_rate_in_sec, $resolution);
 }
 
 
@@ -845,16 +1035,27 @@ sub _get_rrd_file_name {
                        $ds_name,
                        $type_id);
 
-    DEBUG "[DEBUG] rrd filename: $file\n";
+    DEBUG "rrd filename: $file\n";
 
     return $file;
 }
 
 
-sub _create_rrd_file {
-    my ($self, $rrd_file, $service, $ds_name, $ds_config, $first_epoch) = @_;
+sub _get_rrd_field_name {
+    my ($self, $ds_name, $ds_config) = @_;
 
-    INFO "[INFO] creating rrd-file for $service->$ds_name: '$rrd_file'";
+    $ds_config = $self->_get_rrd_data_source_with_defaults($ds_config);
+    my $type_id = lc(substr(($ds_config->{type}), 0, 1));
+
+    # Format: {field}-{type_id} (e.g., idle-g, tx-d)
+    return "$ds_name-$type_id";
+}
+
+
+sub _create_rrd_file {
+    my ($self, $rrd_file, $service, $ds_list, $first_epoch) = @_;
+
+    DEBUG "creating rrd-file for $service: '$rrd_file'";
 
     $rrd_file = File::Spec->catfile($config->{dbdir}, $rrd_file);
 
@@ -862,7 +1063,10 @@ sub _create_rrd_file {
 
     my @args;
 
-    $ds_config = $self->_get_rrd_data_source_with_defaults($ds_config);
+    # All DS in one file share the RRA layout: the grouping logic only
+    # merges fields with identical step & graph_data_size, so the first
+    # entry's config is representative.
+    my $ds_config = $self->_get_rrd_data_source_with_defaults($ds_list->[0][1]);
     my $resolution = $ds_config->{graph_data_size};
     my ($update_rate_in_sec, $is_update_aligned) = parse_update_rate($ds_config->{update_rate});
     if ($resolution eq 'normal') {
@@ -897,7 +1101,7 @@ sub _create_rrd_file {
         # FULL_NB, MULTIPLIER_1 MULTIPLIER_1_NB, ... MULTIPLIER_NMULTIPLIER_N_NB
         my @resolutions_computer = parse_custom_resolution($1, $update_rate_in_sec);
         my @enlarged_resolutions = enlarge_custom_resolution(@resolutions_computer);
-        foreach my $resolution_computer(@resolutions_computer) {
+		foreach my $resolution_computer(@enlarged_resolutions) {
             my ($multiplier, $multiplier_nb) = @{$resolution_computer};
             push (@args,
                 "RRA:AVERAGE:0.5:$multiplier:$multiplier_nb",
@@ -914,14 +1118,23 @@ sub _create_rrd_file {
         $rrd_file,
         "--start", ($first_epoch - $update_rate_in_sec),
 	"-s", $update_rate_in_sec,
-        sprintf('DS:42:%s:%s:%s:%s',
-                $ds_config->{type}, $heartbeat, $ds_config->{min}, $ds_config->{max}),
     );
 
-    INFO "[INFO] RRDs::create @args";
+    # One DS per field; type/heartbeat/min/max are per-DS
+    foreach my $ds_entry (@$ds_list) {
+        my ($name, $cfg) = @$ds_entry;
+        $cfg = $self->_get_rrd_data_source_with_defaults($cfg);
+        push (@args,
+            sprintf('DS:%s:%s:%s:%s:%s',
+                    $self->_get_rrd_field_name($name, $cfg),
+                    $cfg->{type}, $heartbeat, $cfg->{min}, $cfg->{max}),
+        );
+    }
+
+    DEBUG "RRDs::create @args";
     RRDs::create @args unless $ENV{NO_UPDATE_RRD};
     if (my $ERROR = RRDs::error) {
-        ERROR "[ERROR] Unable to create '$rrd_file': $ERROR";
+        ERROR "Unable to create '$rrd_file': $ERROR";
     }
 }
 
@@ -946,7 +1159,7 @@ sub parse_custom_resolution {
 	my @elems = split(',\s*', shift);
 	my $update_rate = shift;
 
-	DEBUG "[DEBUG] update_rate: $update_rate";
+	DEBUG "update_rate: $update_rate";
 
         my @computer_format;
 
@@ -964,9 +1177,9 @@ sub parse_custom_resolution {
                 if ($elem =~ m/(\d+) (\d+)/) {
                         # nothing to do, already in computer format
                         push @computer_format, [$1, $2];
-                } elsif ($elem =~ m/(\w+) for (\w+)/) {
-                        my $nb_sec = to_sec($1);
-                        my $for_sec = to_sec($2);
+                } elsif ($elem =~ m/(\d+[smhdwty]?) for (\d+[smhdwty]?)/i) {
+                        my $nb_sec = munin_duration_to_sec($1);
+                        my $for_sec = munin_duration_to_sec($2);
 
 			my $multiplier = int ($nb_sec / $update_rate);
                         my $multiplier_nb = int ($for_sec / $nb_sec);
@@ -979,7 +1192,7 @@ sub parse_custom_resolution {
 				next;
 			}
 
-			DEBUG "[DEBUG] $elem"
+			DEBUG "$elem"
 				. " -> nb_sec:$nb_sec, for_sec:$for_sec"
 				. " -> multiplier:$multiplier, multiplier_nb:$multiplier_nb"
 			;
@@ -992,30 +1205,49 @@ sub parse_custom_resolution {
 
 # return the number of seconds
 # for the human readable format
-# s : second,  m : minute, h : hour
-# d : day, w : week, t : month, y : year
-sub to_sec {
-	my $secs_table = {
-		"s" => 1,
-		"m" => 60,
-		"h" => 60 * 60,
-		"d" => 60 * 60 * 24,
-		"w" => 60 * 60 * 24 * 7,
-		"t" => 60 * 60 * 24 * 31, # a month always has 31 days
-		"y" => 60 * 60 * 24 * 365, # a year always has 365 days
-	};
+#
+# Flush buffered RRD updates. $pending is
+#     { rrd_file => { when => { rrd_ds_name => value } } }
+# One RRDtool update call is made per (file, DS template); consecutive
+# timestamps sharing the same template are vectorized into a single call.
+# Updates to one file must be strictly increasing in time, so rows are
+# emitted in timestamp order and batching never crosses a template change.
+sub _flush_rrd_updates {
+	my ($self, $pending) = @_;
 
-	my ($target) = @_;
-	if ($target =~ m/(\d+)([smhdwty])/i) {
-		return $1 * $secs_table->{$2};
-	} else {
-		# no recognised unit, return the int value as seconds
-		return int $target;
+	for my $rrd_file (sort keys %$pending) {
+		my $by_when = $pending->{$rrd_file};
+
+		my ($template, @whens, @values);
+		my $flush = sub {
+			return unless @whens;
+			$self->_update_rrd_file($rrd_file, $template, {
+				"when" => [@whens],
+				"value" => [@values],
+			});
+			@whens = @values = ();
+		};
+
+		for my $when (sort { $a <=> $b } keys %$by_when) {
+			my $vals = $by_when->{$when};
+			my @ds_names = sort keys %$vals;
+			my $new_template = join(":", @ds_names);
+			my $row = join(":", map { convert_to_float($vals->{$_}) } @ds_names);
+
+			# Flush before starting a new template: the per-file updates
+			# must stay strictly increasing in time
+			$flush->() if defined($template) && $new_template ne $template;
+			$template = $new_template;
+
+			push @whens, $when;
+			push @values, $row;
+		}
+		$flush->();
 	}
 }
 
 sub _update_rrd_file {
-	my ($self, $rrd_file, $ds_name, $ds_values) = @_;
+	my ($self, $rrd_file, $template, $ds_values) = @_;
 
 	$rrd_file = File::Spec->catfile($config->{dbdir}, $rrd_file);
 
@@ -1026,9 +1258,9 @@ sub _update_rrd_file {
 
 	if ($config->{"rrdcached_socket"}) {
 		if (! -e $config->{"rrdcached_socket"} || ! -w $config->{"rrdcached_socket"}) {
-			WARN "[WARN] RRDCached feature ignored: rrdcached socket not writable";
+			WARN "RRDCached feature ignored: rrdcached socket not writable";
 		} elsif($RRDs::VERSION < 1.3){
-			WARN "[WARN] RRDCached feature ignored: perl RRDs lib version must be at least 1.3. Version found: " . $RRDs::VERSION;
+			WARN "RRDCached feature ignored: perl RRDs lib version must be at least 1.3. Version found: " . $RRDs::VERSION;
 		} else {
 			# Using the RRDCACHED_ADDRESS environment variable, as
 			# it is way less intrusive than the command line args.
@@ -1048,7 +1280,9 @@ sub _update_rrd_file {
 		next if ($current_updated_timestamp && $when <= $current_updated_timestamp);
 
 		# RRDtool does not like scientific format so we convert it.
-		$value = convert_to_float($value);
+		# Multi-DS value strings ("v1:v2:...") are pre-converted by the
+		# caller and must be left alone.
+		$value = convert_to_float($value) unless $value =~ /:/;
 
 		# Schedule for addition
 		push @update_rrd_data, "$when:$value";
@@ -1057,7 +1291,7 @@ sub _update_rrd_file {
 		$current_updated_value = $value;
 	}
 
-	DEBUG "[DEBUG] Updating $rrd_file with @update_rrd_data";
+	DEBUG "Updating $rrd_file with @update_rrd_data";
 	if ($ENV{RRDCACHED_ADDRESS} && (scalar @update_rrd_data > 32) ) {
 		# RRDCACHED only takes about 4K worth of commands. If the commands is
 		# too large, we have to break it in smaller calls.
@@ -1068,20 +1302,28 @@ sub _update_rrd_file {
 		# will buffer for us as suggested on the rrd mailing-list.
 		# https://lists.oetiker.ch/pipermail/rrd-users/2011-October/018196.html
 		for my $update_rrd_data (@update_rrd_data) {
-			DEBUG "RRDs::update($rrd_file, $update_rrd_data)";
-			RRDs::update($rrd_file, $update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+			DEBUG "RRDs::update($rrd_file, -t $template, $update_rrd_data)";
+			if (defined $template) {
+				RRDs::update($rrd_file, "-t", $template, $update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+			} else {
+				RRDs::update($rrd_file, $update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+			}
 			# Break on error.
 			last if RRDs::error;
 		}
 	} else {
 		# normal vector-update the RRD
-		DEBUG "RRDs::update($rrd_file, @update_rrd_data)";
-		RRDs::update($rrd_file, @update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+		DEBUG "RRDs::update($rrd_file, -t $template, @update_rrd_data)";
+		if (defined $template) {
+			RRDs::update($rrd_file, "-t", $template, @update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+		} else {
+			RRDs::update($rrd_file, @update_rrd_data) unless $ENV{NO_UPDATE_RRD};
+		}
 	}
 
 	if (my $ERROR = RRDs::error) {
 		#confess Dumper @_;
-		ERROR "[ERROR] In RRD: Error updating $rrd_file: $ERROR";
+		ERROR "In RRD: Error updating $rrd_file: $ERROR";
 	}
 
 	return $current_updated_timestamp;

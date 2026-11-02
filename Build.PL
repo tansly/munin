@@ -104,7 +104,7 @@ my $build = Module::Build->new(
     license            => 'gpl_2',
     configure_requires => { 'Module::Build' => '0.21', },
     requires           => {
-        'perl'                   => '5.10.0',
+        'perl'                   => '5.10.1',
         'DBD::SQLite'            => '1.35',
         'DBI'                    => '1.616',
         'HTML::Template::Pro'    => '0',
@@ -129,7 +129,6 @@ my $build = Module::Build->new(
         'etc/munin-node.conf.PL'          => 'etc/munin-node.conf.sample',
         'etc/munin.conf.PL'               => 'etc/munin.conf.sample',
         'lib/Munin.pm.PL'                 => 'lib/Munin.pm',
-        'lib/Munin/Common/Defaults.pm.PL' => 'lib/Munin/Common/Defaults.pm',
         'script/munin-cron.PL'            => 'script/munin-cron',
     },
     etc_files => {
@@ -153,15 +152,19 @@ my $build = Module::Build->new(
             script/munin-node-configure
             script/munin-run
             script/munin-update
+            script/munin-upgrade-db
             )
     ],
     test_requires => {
         'Devel::Confess'      => '0',
+        'Directory::Scratch'  => '0',
         'IO::Scalar'          => '0',
         'Test::Class'         => '0',
         'Test::Differences'   => '0.62',
+        'Test::Exception'     => '0',
         'Test::MockModule'    => '0',
         'Test::MockObject'    => '0',
+        'Test::MockObject::Extends' => '0',
         'Test::Deep'          => '0',
         'Test::LongString'    => '0',
         'Test::Perl::Critic'  => '0',
