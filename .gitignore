@@ -2,12 +2,22 @@
 *~
 *.bak
 
+# Local planning docs
+plans/
+
+# Test artifacts
+-selectre/
+
 # Perl Builded files
 /blib/
 /Build
 /build/
 /_build/
 /cover_db/
+/cover_db.tgz
+/cover_runs.tgz
+/out/
+/.prove
 /MANIFEST
 /META.json
 /META.yml
@@ -15,7 +25,6 @@
 /MYMETA.yml
 
 # Generated files (foo.PL -> foo)
-lib/Munin/Common/Defaults.pm
 lib/Munin.pm
 etc/munin.conf.sample
 etc/munin-node.conf.sample
@@ -25,6 +34,17 @@ script/munin-cron
 # Dev Sandbox
 /sandbox/
 local/
+
+# Test sample data (generated at test time)
+t/sample_data/*.rrd
+t/sample_data/**/*.rrd
+t/sample_data/datafile.sqlite
+
+# Test TLS certs (generated at test time)
+t/tls/*_cert.pem
+t/tls/*_key.pem
+t/tls/CA/*.pem
+t/tls/CA/*.srl
 
 # editor files
 .idea/
@@ -38,3 +58,11 @@ local/
 /RELEASE.docker
 /.bash_history
 /.viminfo
+
+# Build artifacts
+/selectre/
+out/
+*.dummy
+
+# Build/lint output
+out/

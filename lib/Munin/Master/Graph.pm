@@ -188,26 +188,27 @@ sub handle_request
 	DEBUG "($graph_path, $time, $start, $end, $format)\n";
 
 	# Find the service to display
-	my $sth_url = $dbh->prepare_cached("SELECT id, type FROM url WHERE path = ?");
+	my $sth_url = $dbh->prepare_cached("SELECT grp_id, node_id, service_id FROM url WHERE path = ?");
 	if (not defined($sth_url)) {
 		# potential cause: permission problem
 		my $msg = "Failed to access database: " . $DBI::errstr;
-		WARNING $msg;
+		WARN $msg;
 		die $msg;
 	}
 	$sth_url->execute($graph_path);
-	my ($id, $type) = $sth_url->fetchrow_array;
+	my ($grp_id, $node_id, $service_id) = $sth_url->fetchrow_array;
 	$sth_url->finish();
 
-	if (! defined $id) {
+	if (! defined $grp_id && ! defined $node_id && ! defined $service_id) {
 		# Not found
 		print "HTTP/1.0 404 Not found\r\n";
 		print $cgi->header(
 			"-X-Reason" => "'$graph_path' Not Found in DB",
 		);
 		goto CLEANUP;
-	} elsif ($type ne "service") {
+	} elsif (! defined $service_id) {
 		# Not supported yet
+		my $type = defined $grp_id ? 'group' : 'node';
 		print "HTTP/1.0 404 Not found\r\n";
 		print $cgi->header(
 			"-X-Reason" => "'$type' graphing is not supported yet",
@@ -215,38 +216,38 @@ sub handle_request
 		goto CLEANUP;
 	}
 
-	DEBUG "found node=$id, type=$type";
+	DEBUG "found service=$service_id";
 
-	my $dbdir = get_param("dbdir");
+	my $dbdir = Munin::Master::Update::get_param("dbdir", $dbh);
 
 	# Here's the most common case: only plain plugins
 	my $sth;
 
 	$sth = $dbh->prepare_cached("SELECT value FROM service_attr WHERE id = ? and name = ?");
-	$sth->execute($id, "graph_title");
+	$sth->execute($service_id, "graph_title");
 	my ($graph_title) = $sth->fetchrow_array();
 
-	$sth->execute($id, "graph_period");
+	$sth->execute($service_id, "graph_period");
 	my ($graph_period) = $sth->fetchrow_array();
 	$graph_period = "second" unless $graph_period;
 
 	# Note that graph_vtitle is *NOT* supported anymore
-	$sth->execute($id, "graph_vlabel");
+	$sth->execute($service_id, "graph_vlabel");
 	my ($graph_vlabel) = $sth->fetchrow_array();
 	$graph_vlabel =~ s/\$\{graph_period\}/$graph_period/g if $graph_vlabel;
 
 	# Note: This will be the graph order computed in munin-update,
 	# not the graph_order emitted by the plugin.
-	$sth->execute($id, "graph_order");
+	$sth->execute($service_id, "graph_order");
 	my ($graph_order) = $sth->fetchrow_array() || "";
 	DEBUG "graph_order: $graph_order";
 
-	$sth->execute($id, "graph_args");
+	$sth->execute($service_id, "graph_args");
 	my ($graph_args) = $sth->fetchrow_array() || "";
 	my @rrd_graph_args = split /\s+/, $graph_args;
 	DEBUG "graph_args: $graph_args";
 
-	$sth->execute($id, "graph_printf");
+	$sth->execute($service_id, "graph_printf");
 	my ($graph_printf) = $sth->fetchrow_array();
 	if (! defined $graph_printf) {
 		# If the base unit is 1024 then 1012.56 is a valid
@@ -254,7 +255,7 @@ sub handle_request
 		$graph_printf = ($graph_args =~ /--base\s+1024/) ? "%7.2lf" : "%6.2lf";
 	}
 
-	$sth->execute($id, "graph_scale");
+	$sth->execute($service_id, "graph_scale");
 	my ($graph_scale) = $sth->fetchrow_array() || "";
 	DEBUG "graph_scale: $graph_scale";
 	if (lc($graph_scale) eq 'no') {
@@ -269,9 +270,9 @@ sub handle_request
 		SELECT
 			ds.name,
 			l.value,
-			rf.value,
-			rd.value,
-			ra.value,
+			rr.file,
+			rr.field,
+			rr.alias,
 			rc.value,
 			gc.value,
 			gd.value,
@@ -290,9 +291,7 @@ sub handle_request
 			'dummy' as dummy
 		FROM ds
 		LEFT OUTER JOIN ds_attr l ON l.id = ds.id AND l.name = 'label'
-		LEFT OUTER JOIN ds_attr rf ON rf.id = ds.id AND rf.name = 'rrd:file'
-		LEFT OUTER JOIN ds_attr rd ON rd.id = ds.id AND rd.name = 'rrd:field'
-		LEFT OUTER JOIN ds_attr ra ON ra.id = ds.id AND ra.name = 'rrd:alias'
+		LEFT OUTER JOIN ds_rrd rr ON rr.ds_id = ds.id
 		LEFT OUTER JOIN ds_attr rc ON rc.id = ds.id AND rc.name = 'cdef'
 		LEFT OUTER JOIN ds_attr gc ON gc.id = ds.id AND gc.name = 'colour'
 		LEFT OUTER JOIN ds_attr gd ON gd.id = ds.id AND gd.name = 'draw'
@@ -302,10 +301,10 @@ sub handle_request
 		LEFT OUTER JOIN ds_attr sm ON sm.id = ds.id AND sm.name = 'sum'
 		LEFT OUTER JOIN ds_attr st ON st.id = ds.id AND st.name = 'stack'
 		LEFT OUTER JOIN ds_attr rl ON rl.id = ds.id AND rl.name = 'rrd:last'
-		WHERE ds.service_id = ?
+		WHERE ds.service_id = ? AND ds.deleted = 0
 		ORDER BY ds.ordr ASC
 	");
-	$sth->execute($id);
+	$sth->execute($service_id);
 
 	# Collect the field set in the graph and
 	my $graph_has_negative = 0;
@@ -793,7 +792,7 @@ sub remove_dups {
 sub is_int {
 	my ($str) = @_;
 
-	return ($str =~ m/[0-9]+/);
+	return ($str =~ m/^\d+$/);
 }
 
 sub escape_for_rrd {
@@ -971,8 +970,8 @@ sub get_alias_rrdfile
 	# This is a virtual DS, we have to fetch the original values
 	my ($_rrdfile, $_rrdfield, $_lastupdated) = $dbh->selectrow_array("
 		SELECT
-			rf.value,
-			rd.value,
+			rr.file,
+			rr.field,
 			rl.value,
 			'dummy' as dummy
 		FROM ds
@@ -980,27 +979,14 @@ sub get_alias_rrdfile
 			s.name = ?
 		OR	s.path = ?
 		)
-		LEFT OUTER JOIN ds_attr rf ON rf.id = ds.id AND rf.name = 'rrd:file'
-		LEFT OUTER JOIN ds_attr rd ON rd.id = ds.id AND rd.name = 'rrd:field'
+		LEFT OUTER JOIN ds_rrd rr ON rr.ds_id = ds.id
 		LEFT OUTER JOIN ds_attr rl ON rl.id = ds.id AND rl.name = 'rrd:last'
-		WHERE ds.name = ?
+		WHERE ds.name = ? AND ds.deleted = 0
 		ORDER BY ds.ordr ASC
 	", undef, $_alias_service, $_alias_service, $_alias_ds);
 	DEBUG "($_alias_service $_alias_ds) = ($_rrdfile $_rrdfield, $_lastupdated)";
 
 	return ($_rrdfile, $_rrdfield, $_lastupdated);
-}
-
-sub get_param
-{
-	my ($param) = @_;
-
-	# Ok, now SQL is needed to go further
-        use DBI;
-	my $datafilename = $ENV{MUNIN_DBURL} || "$Munin::Common::Defaults::MUNIN_DBDIR/datafile.sqlite";
-	my $dbh = Munin::Master::Update::get_dbh(1);
-	my ($value) = $dbh->selectrow_array("SELECT value FROM param WHERE name = ?", undef, ($param));
-	return $value;
 }
 
 1;
